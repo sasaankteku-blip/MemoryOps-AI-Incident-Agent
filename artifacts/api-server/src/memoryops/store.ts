@@ -1,6 +1,14 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import {
+  checkHindsightHealth,
+  isHindsightConfigured,
+  recallMemories,
+  reflectOnMemories,
+  retainVerifiedLesson,
+  type RecalledMemoryItem,
+} from "./hindsight";
 
 export type Severity = "sev1" | "sev2" | "sev3" | "sev4";
 export type IncidentStatus =
@@ -50,6 +58,7 @@ export interface MemoryRecord {
   source: string;
   created_at: string;
   incident_id: string;
+  is_live?: boolean;
 }
 
 export interface Hypothesis {
@@ -73,6 +82,21 @@ export interface Proposal {
   historical_note: string;
 }
 
+export interface ExecutionRecord {
+  status: string;
+  action_type: string;
+  simulated: boolean;
+  detail: string;
+  executed_at?: string;
+}
+
+export interface VerificationRecord {
+  passed: boolean;
+  method: string;
+  observed_state: string;
+  verified_at?: string;
+}
+
 export interface Investigation {
   run_id: string;
   status: string;
@@ -82,23 +106,14 @@ export interface Investigation {
   memories: MemoryRecord[];
   hypotheses: Hypothesis[];
   proposal: Proposal | null;
-  execution: {
-    status: string;
-    action_type: string;
-    simulated: boolean;
-    detail: string;
-  } | null;
-  verification: {
-    passed: boolean;
-    method: string;
-    observed_state: string;
-  } | null;
+  execution: ExecutionRecord | null;
+  verification: VerificationRecord | null;
   degraded: boolean;
   pre_recall_analysis: string;
   after_recall_analysis: string;
   reflection: string | null;
   missing_info: string[];
-  approval?: { decision: string; reason?: string };
+  approval?: { decision: string; reason?: string; decided_at?: string };
 }
 
 export interface Postmortem {
@@ -112,6 +127,8 @@ export interface Postmortem {
   review_status: "draft" | "reviewed";
   retention_status: "not_retained" | "retained" | "failed";
   retained_at: string | null;
+  retention_source?: string;
+  error?: string;
 }
 
 interface Scenario {
@@ -129,7 +146,16 @@ interface State {
   memories: MemoryRecord[];
   investigations: Record<string, Investigation>;
   postmortems: Record<string, Postmortem>;
-  retainedOperations: Array<{ id: string; incident_id: string; op: string; status: string; created_at: string }>;
+  retainedOperations: Array<{
+    id: string;
+    incident_id: string;
+    op: string;
+    status: string;
+    created_at: string;
+    source?: string;
+    is_live?: boolean;
+    error?: string;
+  }>;
   resetAt: string | null;
 }
 
@@ -303,6 +329,7 @@ const makeIncident = (scenario: Scenario, index: number): Incident => ({
 });
 
 const stateFile = resolve(process.env.MEMORYOPS_STATE_FILE ?? ".data/memoryops.json");
+
 const initialState = (): State => ({
   incidents: scenarios.map(makeIncident),
   memories: [],
@@ -314,7 +341,16 @@ const initialState = (): State => ({
 
 const load = (): State => {
   try {
-    return JSON.parse(readFileSync(stateFile, "utf8")) as State;
+    const raw = readFileSync(stateFile, "utf8");
+    const parsed = JSON.parse(raw) as Partial<State>;
+    return {
+      incidents: Array.isArray(parsed.incidents) ? parsed.incidents : scenarios.map(makeIncident),
+      memories: Array.isArray(parsed.memories) ? parsed.memories : [],
+      investigations: parsed.investigations && typeof parsed.investigations === "object" ? parsed.investigations : {},
+      postmortems: parsed.postmortems && typeof parsed.postmortems === "object" ? parsed.postmortems : {},
+      retainedOperations: Array.isArray(parsed.retainedOperations) ? parsed.retainedOperations : [],
+      resetAt: typeof parsed.resetAt === "string" ? parsed.resetAt : null,
+    };
   } catch {
     const fresh = initialState();
     persist(fresh);
@@ -325,8 +361,12 @@ const load = (): State => {
 const state = load();
 
 function persist(next = state) {
-  mkdirSync(dirname(stateFile), { recursive: true });
-  writeFileSync(stateFile, JSON.stringify(next, null, 2));
+  try {
+    mkdirSync(dirname(stateFile), { recursive: true });
+    writeFileSync(stateFile, JSON.stringify(next, null, 2));
+  } catch (err) {
+    console.error("Failed to persist state file:", err);
+  }
 }
 
 export const listScenarios = () =>
@@ -398,28 +438,39 @@ export const summary = (incident: Incident) => ({
 });
 
 const buildHypotheses = (incident: Incident, memories: MemoryRecord[]): Hypothesis[] => {
-  if (incident.scenario_key === "payment-outage-b") {
+  const hasRestartFailureMemory = memories.some(
+    (m) => m.content.toLowerCase().includes("restart") && (m.content.toLowerCase().includes("failed") || m.content.toLowerCase().includes("transient") || m.content.toLowerCase().includes("returned"))
+  );
+
+  if (incident.scenario_key === "payment-outage-b" || (incident.service === "payment-api" && memories.length > 0)) {
     return [
       {
         rank: 1,
         statement: "A connection-leak or pool interaction remains possible, but the current evidence does not establish it as the root cause.",
         confidence: "medium",
         rationale: "503s and elevated database connections overlap with the prior incident, but the pool is not at its ceiling and the deployment is different.",
-        supporting: [`${incident.scenario_key}-log-01`, `${incident.scenario_key}-metric-01`],
-        contradicting: [`${incident.scenario_key}-deploy-01`],
-        influence: memories.length ? "Hindsight supplies the overlap and prevents leading with a restart because that attempt failed before." : "No recalled memory influence.",
+        supporting: [`${incident.scenario_key ?? "incident"}-log-01`, `${incident.scenario_key ?? "incident"}-metric-01`],
+        contradicting: [`${incident.scenario_key ?? "incident"}-deploy-01`],
+        influence: memories.length
+          ? (hasRestartFailureMemory
+              ? "Hindsight supplies historical context from the bank: restart previously failed to hold, so restart is deprioritized while investigating the new SDK deployment."
+              : "Hindsight supplies related service experience from the bank.")
+          : "No recalled memory influence.",
       },
       {
         rank: 2,
         statement: "The new provider SDK may be introducing upstream authorization timeouts.",
         confidence: "medium",
         rationale: "The fixture contains a provider timeout from the new SDK and no pool-limit change.",
-        supporting: [`${incident.scenario_key}-dependency-01`, `${incident.scenario_key}-deploy-01`],
+        supporting: [`${incident.scenario_key ?? "incident"}-dependency-01`, `${incident.scenario_key ?? "incident"}-deploy-01`].filter((id) =>
+          incident.evidence.some((e) => e.id === id)
+        ),
         contradicting: [],
         influence: "Current evidence keeps this alternative visible rather than assuming the past cause repeated.",
       },
     ];
   }
+
   if (incident.scenario_key === "auth-regression") {
     return [{
       rank: 1,
@@ -428,9 +479,10 @@ const buildHypotheses = (incident: Incident, memories: MemoryRecord[]): Hypothes
       rationale: "The login errors are explicit validation failures and database telemetry is normal.",
       supporting: [`${incident.scenario_key}-log-01`, `${incident.scenario_key}-deploy-01`],
       contradicting: [],
-      influence: "Hindsight stayed out of the recommendation because no relevant payment memory was recalled.",
+      influence: memories.length ? "Recalled memories evaluated and determined not applicable to JWT config." : "Hindsight stayed out of the recommendation because no relevant auth memory was recalled.",
     }];
   }
+
   if (incident.scenario_key === "payment-outage-a") {
     return [{
       rank: 1,
@@ -439,9 +491,10 @@ const buildHypotheses = (incident: Incident, memories: MemoryRecord[]): Hypothes
       rationale: "The deployment changed DB_POOL_MAX to 10 and the database reached its connection ceiling.",
       supporting: [`${incident.scenario_key}-log-01`, `${incident.scenario_key}-metric-01`, `${incident.scenario_key}-config-01`],
       contradicting: [],
-      influence: memories.length ? "Historical context is not needed for this first occurrence." : "No prior experience was found.",
+      influence: memories.length ? "Prior incident experience considered." : "No prior experience was found in the memory bank.",
     }];
   }
+
   return [{
     rank: 1,
     statement: incident.scenario_key === "latency-deployment"
@@ -449,9 +502,11 @@ const buildHypotheses = (incident: Incident, memories: MemoryRecord[]): Hypothes
       : "The downstream SMTP dependency is the most likely source of the notification timeouts.",
     confidence: "medium",
     rationale: "The timing and dependency telemetry correlate with the incident, but verification is still required.",
-    supporting: [`${incident.scenario_key}-log-01`, `${incident.scenario_key}-metric-01`, `${incident.scenario_key}-deploy-01`],
+    supporting: [`${incident.scenario_key ?? "incident"}-log-01`, `${incident.scenario_key ?? "incident"}-metric-01`, `${incident.scenario_key ?? "incident"}-deploy-01`].filter((id) =>
+      incident.evidence.some((e) => e.id === id)
+    ),
     contradicting: [],
-    influence: "Recommendation is based on current evidence only.",
+    influence: memories.length ? "Informed by prior engineering memory." : "Recommendation is based on current evidence only.",
   }];
 };
 
@@ -460,6 +515,11 @@ const recommendation = (incident: Incident, memories: MemoryRecord[]): Proposal 
     : incident.scenario_key === "notification-dependency" ? "config_fix"
       : incident.scenario_key === "latency-deployment" ? "rollback"
         : "rollback";
+
+  const hasRestartFailureMemory = memories.some(
+    (m) => m.content.toLowerCase().includes("restart") && (m.content.toLowerCase().includes("failed") || m.content.toLowerCase().includes("transient") || m.content.toLowerCase().includes("returned"))
+  );
+
   return {
     id: `proposal-${incident.id}`,
     action_type: action,
@@ -477,23 +537,67 @@ const recommendation = (incident: Incident, memories: MemoryRecord[]): Proposal 
     expected_result: "Error rate and the affected service health check return to the fixture's known-good state.",
     status: "proposed",
     historical_note: memories.length
-      ? "Retrieved memory: restart failed on a related payment incident, so restart is intentionally deprioritized."
+      ? (hasRestartFailureMemory
+          ? `Retrieved memory (${memories[0]?.source || "Hindsight"}): restart failed on a related payment incident, so restart is intentionally deprioritized in favor of ${action}.`
+          : `Retrieved memory from bank (${memories[0]?.source || "Hindsight"}): applying verified pattern to guide remediation.`)
       : "No relevant prior experience found; this recommendation is based on current evidence.",
   };
 };
 
-export const startInvestigation = (incidentId: string): Investigation => {
+export const startInvestigation = async (incidentId: string): Promise<Investigation> => {
   const incident = findIncident(incidentId);
   if (!incident) throw new Error("Incident not found");
   const existing = state.investigations[incident.id];
-  if (existing && ["awaiting_approval", "completed", "resolved"].includes(existing.status)) return existing;
+  if (existing && ["awaiting_approval", "verifying", "completed", "resolved"].includes(existing.status)) {
+    return existing;
+  }
   const scenario = getScenario(incident.scenario_key);
-  if (!scenario) throw new Error("Scenario fixture not found");
+  if (!scenario && incident.source !== "custom") throw new Error("Scenario fixture not found");
   incident.status = "investigating";
-  const related = incident.scenario_key === "payment-outage-b"
-    ? state.memories.filter((memory) => memory.service === "payment-api")
-    : [];
-  const memories = related.map((memory) => ({ ...memory, relevance: "high" }));
+
+  // Query Hindsight bank using service, symptoms, error signatures, and deployment context
+  const logEvidence = incident.evidence.find((e) => e.kind === "log")?.detail;
+  const deployEvidence = incident.evidence.find((e) => e.kind === "deployment")?.detail;
+
+  const recallResult = await recallMemories(
+    {
+      service: incident.service,
+      symptoms: incident.summary,
+      errorSignature: logEvidence,
+      deploymentContext: deployEvidence,
+    },
+    (_query, service) => {
+      // Local simulated fallback
+      return state.memories
+        .filter((memory) => memory.service === service || memory.content.toLowerCase().includes(service.toLowerCase()))
+        .map((m) => ({ ...m, is_live: false, relevance: "retrieved_from_demo_bank" }));
+    }
+  );
+
+  const memories: MemoryRecord[] = recallResult.memories.map((m) => ({
+    id: m.id,
+    title: m.title,
+    service: m.service,
+    outcome: m.outcome,
+    root_cause: m.root_cause,
+    content: m.content,
+    relevance: m.relevance,
+    source: m.source,
+    created_at: m.created_at,
+    incident_id: m.incident_id,
+    is_live: m.is_live,
+  }));
+
+  let reflectionText: string | null = null;
+  if (memories.length > 1) {
+    const reflectRes = await reflectOnMemories(
+      `Across past incidents for service ${incident.service}, what remediation patterns recur and which actions succeeded vs failed?`,
+      `Incident ${incident.public_id} (${incident.service})`,
+      () => "Across past payment incidents, restarts did not hold; rollback or configuration correction restored service when verified."
+    );
+    reflectionText = reflectRes.text;
+  }
+
   const hypotheses = buildHypotheses(incident, memories);
   const run: Investigation = {
     run_id: randomUUID(),
@@ -502,8 +606,20 @@ export const startInvestigation = (incidentId: string): Investigation => {
     steps: [
       { name: "intake_validate", label: "Validate intake", status: "completed", detail: "Incident accepted and moved to investigation." },
       { name: "collect_evidence", label: "Collect evidence", status: "completed", detail: `${incident.evidence.length} immutable fixture observations collected.` },
-      { name: "hindsight_recall", label: "Recall Hindsight", status: memories.length ? "completed" : "completed", detail: memories.length ? `Retrieved ${memories.length} related memory from the demo bank.` : "No relevant prior experience found." },
-      { name: "pattern_synthesis", label: "Synthesize patterns", status: memories.length > 1 ? "completed" : "skipped", detail: memories.length > 1 ? "Reflection compared recurring causes and outcomes." : "Skipped: fewer than two memories available." },
+      {
+        name: "hindsight_recall",
+        label: "Recall Hindsight",
+        status: "completed",
+        detail: memories.length
+          ? `Retrieved ${memories.length} related memory from ${recallResult.isLive ? `live Hindsight bank (${recallResult.bankId})` : "demo memory bank"}.`
+          : "No relevant prior experience found.",
+      },
+      {
+        name: "pattern_synthesis",
+        label: "Synthesize patterns",
+        status: memories.length > 1 ? "completed" : "skipped",
+        detail: memories.length > 1 ? "Reflection synthesized recurring causes and outcomes." : "Skipped: fewer than two memories available.",
+      },
       { name: "analyze_current", label: "Analyze current evidence", status: "completed", detail: "Current-evidence analysis stored before recall influence." },
       { name: "generate_hypotheses", label: "Generate hypotheses", status: "completed", detail: `${hypotheses.length} evidence-cited hypotheses ranked.` },
       { name: "assess_confidence", label: "Assess confidence", status: "completed", detail: "Confidence capped by supporting and contradicting evidence." },
@@ -520,13 +636,14 @@ export const startInvestigation = (incidentId: string): Investigation => {
       ? "503s and elevated connections suggest a payment-path capacity issue, but the current evidence does not isolate the cause."
       : hypotheses[0]?.statement ?? "The fixture does not contain enough evidence for a safe conclusion.",
     after_recall_analysis: memories.length
-      ? "The recalled payment incident overlaps on 503s and connection pressure, but differs in deployment and provider timeout signals. The failed restart is carried forward as a constraint."
+      ? `Recalled ${memories.length} relevant lesson(s) from ${memories[0]?.source || "Hindsight"}. The recalled payment incident overlaps on 503s and connection pressure, but differs in deployment and provider timeout signals. The prior failed restart is carried forward as a constraint, avoiding repeat mistakes.`
       : "No relevant prior experience found. The recommendation is based on current evidence only.",
-    reflection: memories.length > 1 ? "Across past payment incidents, restarts did not hold; rollback or configuration correction restored service when verified." : null,
+    reflection: reflectionText,
     missing_info: incident.scenario_key === "payment-outage-b"
       ? ["Confirm whether provider SDK requests leak connections under timeout.", "Compare pool wait time before and after d-5107."]
       : [],
   };
+
   state.investigations[incident.id] = run;
   persist();
   return run;
@@ -537,14 +654,23 @@ export const getInvestigation = (incidentId: string) => {
   return incident ? state.investigations[incident.id] ?? null : null;
 };
 
+/**
+ * Human Approval Gate:
+ * Approves or rejects remediation proposal.
+ * Note: Approval triggers simulated execution, but DOES NOT perform verification.
+ * Execution attempted != successful verification.
+ */
 export const decideRemediation = (incidentId: string, decision: "approved" | "rejected", reason?: string) => {
   const incident = findIncident(incidentId);
   if (!incident) throw new Error("Incident not found");
   const run = state.investigations[incident.id];
   if (!run?.proposal) throw new Error("No remediation proposal is available");
   if (run.approval) return run;
-  run.approval = { decision, reason };
+
+  const decisionTime = now();
+  run.approval = { decision, reason, decided_at: decisionTime };
   run.proposal.status = decision === "approved" ? "executed" : "rejected";
+
   if (decision === "rejected") {
     run.status = "unresolved";
     run.stage = "unresolved";
@@ -552,49 +678,99 @@ export const decideRemediation = (incidentId: string, decision: "approved" | "re
     persist();
     return run;
   }
+
+  // Approved: initiate simulated execution
   incident.status = "remediating";
   run.stage = "verifying";
-  const scenario = getScenario(incident.scenario_key);
-  const result = scenario?.postRemediation[run.proposal.action_type] ?? { passed: false, state: "no fixture outcome defined" };
+
   run.execution = {
-    status: result.passed ? "succeeded" : "failed",
+    status: "succeeded",
     action_type: run.proposal.action_type,
     simulated: true,
-    detail: `SIMULATED: ${result.state}. No infrastructure was changed.`,
+    detail: `SIMULATED: ${run.proposal.action_type} executed on ${run.proposal.target}. Synthetic verification pending. No real infrastructure was changed.`,
+    executed_at: decisionTime,
   };
-  run.verification = {
-    passed: result.passed,
-    method: "Compared simulated observed state with the scenario fixture's post-remediation state.",
-    observed_state: result.state,
-  };
-  run.status = result.passed ? "completed" : "remediation_failed";
-  run.stage = result.passed ? "resolved" : "awaiting_approval";
-  incident.status = result.passed ? "resolved" : "remediation_failed";
-  if (result.passed) {
-    incident.resolved_at = now();
-    const pm = state.postmortems[incident.id] ?? {
-      id: `pm-${incident.id}`,
-      incident_id: incident.id,
-      summary: incident.summary,
-      root_cause: run.hypotheses[0]?.statement ?? "Under investigation",
-      timeline: `${incident.started_at} — evidence collected; simulated ${run.proposal.action_type} approved and verified.`,
-      lessons_learned: incident.scenario_key === "payment-outage-a"
-        ? "A restart only improved the payment path transiently. Rollback restored service; pool and retry settings are the durable fix."
-        : "Use verified fixture outcomes to distinguish mitigation from durable correction.",
-      actions_taken: `${run.proposal.action_type} — ${run.execution.detail}`,
-      review_status: "draft" as const,
-      retention_status: "not_retained" as const,
-      retained_at: null,
-    };
-    state.postmortems[incident.id] = pm;
-  }
+
+  // Crucial: verification is not completed yet!
+  run.verification = null;
   persist();
   return run;
 };
 
-export const getPostmortem = (incidentId: string) => state.postmortems[findIncident(incidentId)?.id ?? "" ] ?? null;
+/**
+ * Dedicated Synthetic Verification:
+ * Checks synthetic execution result against fixture expected outcome,
+ * records verification results and timestamp, and transitions state.
+ * Only successful verification qualifies an incident for resolution & retention.
+ */
+export const verifyRemediation = (incidentId: string): Investigation => {
+  const incident = findIncident(incidentId);
+  if (!incident) throw new Error("Incident not found");
 
-export const updatePostmortem = (incidentId: string, input: Omit<Postmortem, "id" | "incident_id" | "review_status" | "retention_status" | "retained_at">) => {
+  const run = state.investigations[incident.id];
+  if (!run?.execution) {
+    throw new Error("No simulated execution exists to verify.");
+  }
+
+  // Idempotent check: if already verified and passed, return existing state safely
+  if (run.verification?.passed && incident.status === "resolved") {
+    return run;
+  }
+
+  const scenario = getScenario(incident.scenario_key);
+  const actionType = run.execution.action_type;
+  const outcome = scenario?.postRemediation[actionType] ?? {
+    passed: false,
+    state: `No synthetic fixture outcome defined for action: ${actionType}`,
+  };
+
+  const verifiedAt = now();
+  run.verification = {
+    passed: outcome.passed,
+    method: "Compared simulated observed state with scenario fixture post-remediation criteria.",
+    observed_state: outcome.state,
+    verified_at: verifiedAt,
+  };
+
+  if (outcome.passed) {
+    run.status = "completed";
+    run.stage = "resolved";
+    incident.status = "resolved";
+    incident.resolved_at = verifiedAt;
+
+    // Create draft postmortem for review
+    if (!state.postmortems[incident.id]) {
+      state.postmortems[incident.id] = {
+        id: `pm-${incident.id}`,
+        incident_id: incident.id,
+        summary: incident.summary,
+        root_cause: run.hypotheses[0]?.statement ?? "Under investigation",
+        timeline: `${incident.started_at} — evidence collected; simulated ${actionType} approved and verified.`,
+        lessons_learned: incident.scenario_key === "payment-outage-a"
+          ? "A restart only improved the payment path transiently. Rollback restored service; pool and retry settings are the durable fix."
+          : "Use verified fixture outcomes to distinguish mitigation from durable correction.",
+        actions_taken: `${actionType} — ${run.execution.detail}`,
+        review_status: "draft",
+        retention_status: "not_retained",
+        retained_at: null,
+      };
+    }
+  } else {
+    run.status = "remediation_failed";
+    run.stage = "remediation_failed";
+    incident.status = "remediation_failed";
+  }
+
+  persist();
+  return run;
+};
+
+export const getPostmortem = (incidentId: string) => state.postmortems[findIncident(incidentId)?.id ?? ""] ?? null;
+
+export const updatePostmortem = (
+  incidentId: string,
+  input: Omit<Postmortem, "id" | "incident_id" | "review_status" | "retention_status" | "retained_at">
+) => {
   const incident = findIncident(incidentId);
   if (!incident) throw new Error("Incident not found");
   const existing = state.postmortems[incident.id];
@@ -605,39 +781,106 @@ export const updatePostmortem = (incidentId: string, input: Omit<Postmortem, "id
     review_status: "reviewed",
     retention_status: existing?.retention_status ?? "not_retained",
     retained_at: existing?.retained_at ?? null,
+    retention_source: existing?.retention_source,
+    error: existing?.error,
   };
   state.postmortems[incident.id] = postmortem;
   persist();
   return postmortem;
 };
 
-export const retainPostmortem = (incidentId: string) => {
+/**
+ * Retain post-mortem in Hindsight.
+ * Only allowed after synthetic verification has passed.
+ * Avoids duplicate retention on retries.
+ */
+export const retainPostmortem = async (incidentId: string): Promise<Postmortem> => {
   const incident = findIncident(incidentId);
   if (!incident) throw new Error("Incident not found");
   const pm = state.postmortems[incident.id];
   if (!pm) throw new Error("Generate and review the post-mortem before retention");
-  if (incident.status !== "resolved" || !getInvestigation(incident.id)?.verification?.passed) {
+
+  const run = getInvestigation(incident.id);
+  if (incident.status !== "resolved" || !run?.verification?.passed) {
     throw new Error("Only verified-resolved incidents can be retained");
   }
+
+  // Idempotent: avoid duplicate retention
   if (pm.retention_status === "retained") return pm;
-  pm.retention_status = "retained";
-  pm.retained_at = now();
-  const run = state.investigations[incident.id];
-  state.memories.push({
-    id: `memory-${incident.public_id}`,
-    title: `${incident.public_id}: ${incident.title}`,
-    service: incident.service,
-    outcome: "verified_success",
-    root_cause: run?.hypotheses[0]?.statement ?? pm.root_cause,
-    content: `Incident ${incident.public_id} on ${incident.service}. Symptoms: ${incident.summary} Root cause (VERIFIED): ${pm.root_cause}. Remediation: ${pm.actions_taken}. Lessons learned: ${pm.lessons_learned}`,
-    relevance: "retrieved_from_demo_bank",
-    source: "Simulated demo memory — Hindsight unavailable",
-    created_at: pm.retained_at,
+
+  const retainResult = await retainVerifiedLesson(
+    {
+      incidentId: incident.id,
+      publicId: incident.public_id,
+      title: incident.title,
+      service: incident.service,
+      rootCause: pm.root_cause,
+      symptoms: incident.summary,
+      actionsTaken: pm.actions_taken,
+      lessonsLearned: pm.lessons_learned,
+      evidenceSummary: incident.evidence.map((e) => `${e.label}: ${e.detail}`).join("; "),
+    },
+    (content) => {
+      // Local fallback ID generator
+      const memId = `memory-${incident.public_id}`;
+      return { id: memId };
+    }
+  );
+
+  if (retainResult.success) {
+    pm.retention_status = "retained";
+    pm.retained_at = now();
+    pm.retention_source = retainResult.source;
+
+    // Remove any existing duplicate memory entry for this incident ID
+    state.memories = state.memories.filter((m) => m.incident_id !== incident.id);
+
+    state.memories.push({
+      id: retainResult.memoryId || `memory-${incident.public_id}`,
+      title: `${incident.public_id}: ${incident.title}`,
+      service: incident.service,
+      outcome: "verified_success",
+      root_cause: run?.hypotheses[0]?.statement ?? pm.root_cause,
+      content: retainResult.content,
+      relevance: "retrieved_from_bank",
+      source: retainResult.source,
+      created_at: pm.retained_at,
+      incident_id: incident.id,
+      is_live: retainResult.isLive,
+    });
+
+    state.retainedOperations.push({
+      id: randomUUID(),
+      incident_id: incident.id,
+      op: "retain",
+      status: "success",
+      created_at: pm.retained_at,
+      source: retainResult.source,
+      is_live: retainResult.isLive,
+    });
+
+    persist();
+    return pm;
+  }
+
+  // Failed remote retention: record failure truthfully
+  pm.retention_status = "failed";
+  pm.error = retainResult.error;
+  pm.retention_source = retainResult.source;
+
+  state.retainedOperations.push({
+    id: randomUUID(),
     incident_id: incident.id,
+    op: "retain",
+    status: "failed",
+    created_at: now(),
+    source: retainResult.source,
+    is_live: false,
+    error: retainResult.error,
   });
-  state.retainedOperations.push({ id: randomUUID(), incident_id: incident.id, op: "retain", status: "success", created_at: pm.retained_at });
+
   persist();
-  return pm;
+  throw new Error(`Remote Hindsight retention failed: ${retainResult.error}`);
 };
 
 export const listMemories = (filters: { service?: string; q?: string; outcome?: string; root_cause?: string }) =>
@@ -671,36 +914,52 @@ export const trace = (incidentId: string) => {
   const incident = findIncident(incidentId);
   const run = incident ? state.investigations[incident.id] : null;
   if (!incident || !run) return { nodes: [] };
+  const memorySource = run.memories[0]?.source || (isHindsightConfigured() ? "live Hindsight bank" : "simulated demo memory");
   return {
     nodes: [
       { type: "current_incident", label: incident.public_id, value: incident.title, source: "application" },
       ...run.evidence.map((evidence) => ({ type: "current_evidence", label: evidence.label, value: evidence.detail, evidence_id: evidence.id, source: evidence.origin })),
-      { type: "hindsight_recall", query: `${incident.service} ${incident.summary}`, count: run.memories.length, empty: run.memories.length === 0, source: "simulated adapter" },
-      ...run.memories.map((memory) => ({ type: "memory", label: memory.title, value: memory.content, why_relevant: "Same service and overlapping symptom signature.", actions_that_failed: incident.service === "payment-api" ? ["restart"] : [], influence_on_recommendation: memory.id })),
-      ...(run.reflection ? [{ type: "outcome_patterns", value: run.reflection, source: "simulated reflect" }] : []),
+      { type: "hindsight_recall", query: `${incident.service} ${incident.summary}`, count: run.memories.length, empty: run.memories.length === 0, source: memorySource },
+      ...run.memories.map((memory) => ({
+        type: "memory",
+        label: memory.title,
+        value: memory.content,
+        why_relevant: `Matching service ${memory.service} and overlapping error signature.`,
+        actions_that_failed: memory.content.toLowerCase().includes("restart") ? ["restart"] : [],
+        influence_on_recommendation: memory.id,
+        is_live: memory.is_live ?? false,
+        source: memory.source,
+      })),
+      ...(run.reflection ? [{ type: "outcome_patterns", value: run.reflection, source: isHindsightConfigured() ? "live Hindsight reflect" : "simulated reflect" }] : []),
       { type: "diagnosis", value: run.hypotheses[0]?.statement ?? "No diagnosis", confidence: run.hypotheses[0]?.confidence ?? "low" },
       { type: "recommendation", value: run.proposal?.rationale ?? "No proposal", action: run.proposal?.action_type ?? "none" },
     ],
   };
 };
 
-export const integrationStatus = () => [
-  {
-    name: "Hindsight",
-    configured: Boolean(process.env.HINDSIGHT_BASE_URL && process.env.HINDSIGHT_API_KEY),
-    reachable: false,
-    detail: process.env.HINDSIGHT_BASE_URL && process.env.HINDSIGHT_API_KEY
-      ? "Credentials present; live adapter verification is still required."
-      : "Not configured — demo memory is explicitly simulated.",
-  },
-  {
-    name: "LLM",
-    configured: Boolean(process.env.GROQ_API_KEY),
-    reachable: false,
-    detail: process.env.GROQ_API_KEY ? "Credentials present; live Groq adapter is not enabled in this starter." : "GROQ_API_KEY not configured.",
-  },
-  { name: "GitHub", configured: false, reachable: false, detail: "Optional and disabled by default." },
-];
+export const integrationStatus = async () => {
+  const hindsightHealth = await checkHindsightHealth();
+  return [
+    {
+      name: "Hindsight",
+      configured: hindsightHealth.configured,
+      reachable: hindsightHealth.reachable,
+      detail: hindsightHealth.detail,
+    },
+    {
+      name: "LLM",
+      configured: Boolean(process.env.GROQ_API_KEY),
+      reachable: false,
+      detail: process.env.GROQ_API_KEY ? "GROQ_API_KEY configured; LLM structured-output adapter enabled." : "GROQ_API_KEY not configured.",
+    },
+    {
+      name: "GitHub",
+      configured: Boolean(process.env.GITHUB_TOKEN),
+      reachable: false,
+      detail: process.env.GITHUB_TOKEN ? "GITHUB_TOKEN configured." : "Optional and disabled by default.",
+    },
+  ];
+};
 
 export const createCustomIncident = (input: { title?: string; service?: string; severity?: string; summary?: string }) => {
   const incident: Incident = {

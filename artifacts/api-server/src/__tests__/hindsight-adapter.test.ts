@@ -1,0 +1,326 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert";
+import {
+  getHindsightConfig,
+  isHindsightConfigured,
+  createHindsightClient,
+  checkHindsightHealth,
+  formatRetainedContent,
+  retainVerifiedLesson,
+  recallMemories,
+  reflectOnMemories,
+} from "../memoryops/hindsight";
+import { HindsightClient } from "@vectorize-io/hindsight-client";
+
+describe("Phase 2 & 5: Hindsight Adapter Unit & Integration Tests", () => {
+  const origEnv = { ...process.env };
+
+  beforeEach(() => {
+    delete process.env.HINDSIGHT_BASE_URL;
+    delete process.env.HINDSIGHT_API_KEY;
+    delete process.env.HINDSIGHT_BANK_ID;
+  });
+
+  afterEach(() => {
+    process.env = { ...origEnv };
+  });
+
+  describe("1. Configuration and missing credentials", () => {
+    it("reports unconfigured when HINDSIGHT_BASE_URL is missing", () => {
+      assert.strictEqual(isHindsightConfigured(), false);
+      assert.strictEqual(getHindsightConfig(), null);
+      assert.strictEqual(createHindsightClient(), null);
+    });
+
+    it("parses configuration when HINDSIGHT_BASE_URL is provided", () => {
+      process.env.HINDSIGHT_BASE_URL = "https://api.hindsight.vectorize.io";
+      process.env.HINDSIGHT_API_KEY = "test-secret-key";
+      process.env.HINDSIGHT_BANK_ID = "custom-bank";
+
+      assert.strictEqual(isHindsightConfigured(), true);
+      const config = getHindsightConfig();
+      assert.deepStrictEqual(config, {
+        baseUrl: "https://api.hindsight.vectorize.io",
+        apiKey: "test-secret-key",
+        bankId: "custom-bank",
+      });
+
+      const clientObj = createHindsightClient();
+      assert.ok(clientObj);
+      assert.strictEqual(clientObj.bankId, "custom-bank");
+      assert.ok(clientObj.client instanceof HindsightClient);
+    });
+
+    it("defaults bankId to memoryops-demo-northstar when unspecified", () => {
+      process.env.HINDSIGHT_BASE_URL = "http://localhost:8888";
+      const config = getHindsightConfig();
+      assert.strictEqual(config?.bankId, "memoryops-demo-northstar");
+    });
+
+    it("health check reports honest unconfigured status", async () => {
+      const status = await checkHindsightHealth();
+      assert.strictEqual(status.configured, false);
+      assert.strictEqual(status.reachable, false);
+      assert.match(status.detail, /not configured/i);
+    });
+  });
+
+  describe("2. Correct retain, recall, and reflect SDK calls with mocks", () => {
+    it("formats concise, evidence-grounded lesson with verified root cause", () => {
+      const formatted = formatRetainedContent({
+        incidentId: "inc-1",
+        publicId: "INC-2025-0117",
+        title: "Payment pool exhaustion",
+        service: "payment-api",
+        rootCause: "DB_POOL_MAX reduction from 50 to 10 caused connection starvation",
+        symptoms: "HTTP 503 error burst on payment authorization",
+        actionsTaken: "rollback of deployment d-4821",
+        lessonsLearned: "Restart only temporarily cleared pool; rollback restored service",
+        evidenceSummary: "Error rate 38%; connection ceiling reached",
+      });
+
+      assert.match(formatted, /Incident INC-2025-0117 on service payment-api/);
+      assert.match(formatted, /Symptoms: HTTP 503 error burst/);
+      assert.match(formatted, /Verified Root Cause: DB_POOL_MAX reduction/);
+      assert.match(formatted, /Successful Remediation: rollback/);
+      assert.match(formatted, /Lessons Learned: Restart only temporarily cleared pool/);
+      assert.match(formatted, /Applicable Conditions:/);
+    });
+
+    it("calls client.retain with bankId, content, metadata, and tags", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_BANK_ID = "test-bank";
+
+      let retainCall: { bankId: string; content: unknown; options: unknown } | null = null;
+      const originalRetain = HindsightClient.prototype.retain;
+      HindsightClient.prototype.retain = async function (bankId: string, content: unknown, options?: unknown) {
+        retainCall = { bankId, content, options };
+        return {
+          success: true,
+          bank_id: bankId,
+          items_count: 1,
+          async: false,
+        };
+      };
+
+      try {
+        const result = await retainVerifiedLesson(
+          {
+            incidentId: "inc-100",
+            publicId: "INC-2025-0117",
+            title: "Payment outage",
+            service: "payment-api",
+            rootCause: "Pool exhausted",
+            symptoms: "503 errors",
+            actionsTaken: "rollback",
+            lessonsLearned: "Restart did not work",
+          },
+          () => ({ id: "fallback-id" })
+        );
+
+        assert.strictEqual(result.success, true);
+        assert.strictEqual(result.isLive, true);
+        assert.strictEqual(result.bankId, "test-bank");
+        assert.strictEqual(result.source, "Live Hindsight bank (test-bank)");
+        assert.ok(retainCall);
+        const call = retainCall as any;
+        assert.strictEqual(call.bankId, "test-bank");
+        assert.match(call.content as string, /Pool exhausted/);
+        const opts = call.options as Record<string, unknown>;
+        assert.strictEqual(opts.documentId, "incident-inc-100");
+        assert.deepStrictEqual((opts.metadata as Record<string, string>).verified, "true");
+        assert.deepStrictEqual(opts.tags, ["payment-api", "incident-response", "verified-lesson"]);
+      } finally {
+        HindsightClient.prototype.retain = originalRetain;
+      }
+    });
+
+    it("calls client.recall with bankId and constructed query", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_BANK_ID = "test-bank";
+
+      let recallCall: { bankId: string; query: string; options: unknown } | null = null;
+      const originalRecall = HindsightClient.prototype.recall;
+      HindsightClient.prototype.recall = async function (bankId: string, query: string, options?: unknown) {
+        recallCall = { bankId, query, options };
+        return {
+          results: [
+            {
+              id: "mem-live-1",
+              text: "Prior incident INC-2025-0117: restart failed; rollback succeeded.",
+              context: "Payment pool recovery lesson",
+              entities: ["payment-api"],
+              document_id: "incident-inc-100",
+            },
+          ],
+        };
+      };
+
+      try {
+        const output = await recallMemories(
+          {
+            service: "payment-api",
+            symptoms: "HTTP 503 spike",
+            errorSignature: "Connection timeout",
+            deploymentContext: "d-5107",
+          },
+          () => []
+        );
+
+        assert.strictEqual(output.isLive, true);
+        assert.strictEqual(output.bankId, "test-bank");
+        assert.ok(recallCall);
+        const call = recallCall as any;
+        assert.strictEqual(call.bankId, "test-bank");
+        assert.match(call.query, /payment-api HTTP 503 spike Connection timeout d-5107/);
+        assert.strictEqual(output.memories.length, 1);
+        assert.strictEqual(output.memories[0]?.id, "mem-live-1");
+        assert.strictEqual(output.memories[0]?.is_live, true);
+        assert.strictEqual(output.memories[0]?.source, "Live Hindsight bank (test-bank)");
+      } finally {
+        HindsightClient.prototype.recall = originalRecall;
+      }
+    });
+
+    it("calls client.reflect and returns synthesized opinion", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_BANK_ID = "test-bank";
+
+      let reflectCall: { bankId: string; query: string; options: unknown } | null = null;
+      const originalReflect = HindsightClient.prototype.reflect;
+      HindsightClient.prototype.reflect = async function (bankId: string, query: string, options?: unknown) {
+        reflectCall = { bankId, query, options };
+        return {
+          text: "Across past payment incidents, restart attempts did not hold while rollback restored health.",
+        };
+      };
+
+      try {
+        const output = await reflectOnMemories("What remediation patterns recur for payment-api?");
+        assert.strictEqual(output.isLive, true);
+        assert.strictEqual(output.bankId, "test-bank");
+        assert.strictEqual(output.source, "Live Hindsight reflect (test-bank)");
+        assert.match(output.text, /restart attempts did not hold/);
+        assert.ok(reflectCall);
+        const refCall = reflectCall as any;
+        assert.strictEqual(refCall.bankId, "test-bank");
+      } finally {
+        HindsightClient.prototype.reflect = originalReflect;
+      }
+    });
+  });
+
+  describe("3 & 4. Remote errors, timeouts, and explicit fallback labels", () => {
+    it("falls back gracefully when Hindsight is unconfigured with simulated label", async () => {
+      const recallOut = await recallMemories(
+        { service: "payment-api", symptoms: "503 errors" },
+        () => [
+          {
+            id: "local-1",
+            title: "Local payment lesson",
+            service: "payment-api",
+            outcome: "verified_success",
+            root_cause: "Pool exhaustion",
+            content: "Rollback restored pool",
+            relevance: "high",
+            source: "",
+            created_at: new Date().toISOString(),
+            incident_id: "local-inc",
+            is_live: false,
+          },
+        ]
+      );
+
+      assert.strictEqual(recallOut.isLive, false);
+      assert.strictEqual(recallOut.memories.length, 1);
+      assert.strictEqual(recallOut.memories[0]?.source, "Simulated demo memory — Hindsight unavailable");
+    });
+
+    it("handles remote network error during recall with explicit failure label and fallback", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://bad-host:9999";
+      const originalRecall = HindsightClient.prototype.recall;
+      HindsightClient.prototype.recall = async function () {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:9999");
+      };
+
+      try {
+        const recallOut = await recallMemories(
+          { service: "payment-api", symptoms: "503 errors" },
+          () => [
+            {
+              id: "local-fallback",
+              title: "Local fallback record",
+              service: "payment-api",
+              outcome: "verified_success",
+              root_cause: "Pool leak",
+              content: "Rollback worked",
+              relevance: "high",
+              source: "",
+              created_at: new Date().toISOString(),
+              incident_id: "inc-fallback",
+              is_live: false,
+            },
+          ]
+        );
+
+        assert.strictEqual(recallOut.isLive, false);
+        assert.ok(recallOut.error);
+        assert.strictEqual(recallOut.memories.length, 1);
+        assert.match(recallOut.memories[0]?.source as string, /Hindsight recall failed/);
+      } finally {
+        HindsightClient.prototype.recall = originalRecall;
+      }
+    });
+
+    it("CRITICAL: failed remote retention is NEVER marked as live success", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://bad-host:9999";
+      process.env.HINDSIGHT_BANK_ID = "prod-bank";
+
+      const originalRetain = HindsightClient.prototype.retain;
+      HindsightClient.prototype.retain = async function () {
+        throw new Error("503 Service Unavailable: Hindsight worker queue full");
+      };
+
+      try {
+        const result = await retainVerifiedLesson(
+          {
+            incidentId: "inc-err",
+            publicId: "INC-2025-0999",
+            title: "Outage",
+            service: "payment-api",
+            rootCause: "Leak",
+            symptoms: "500",
+            actionsTaken: "rollback",
+            lessonsLearned: "revert immediately",
+          },
+          () => ({ id: "fallback" })
+        );
+
+        assert.strictEqual(result.success, false);
+        assert.strictEqual(result.isLive, false);
+        assert.ok(result.error);
+        assert.match(result.source, /Failed Hindsight retain/);
+        assert.notStrictEqual(result.source, "Live Hindsight bank (prod-bank)");
+      } finally {
+        HindsightClient.prototype.retain = originalRetain;
+      }
+    });
+
+    it("reflect returns explicit fallback label when remote call fails", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://bad-host:9999";
+      const originalReflect = HindsightClient.prototype.reflect;
+      HindsightClient.prototype.reflect = async function () {
+        throw new Error("Gateway timeout");
+      };
+
+      try {
+        const result = await reflectOnMemories("What works?", undefined, () => "Fallback reflection text");
+        assert.strictEqual(result.isLive, false);
+        assert.strictEqual(result.text, "Fallback reflection text");
+        assert.match(result.source, /Hindsight call failed/);
+      } finally {
+        HindsightClient.prototype.reflect = originalReflect;
+      }
+    });
+  });
+});

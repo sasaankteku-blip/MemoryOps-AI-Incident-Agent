@@ -1,40 +1,62 @@
-# Hindsight verification
+# Hindsight TypeScript SDK Verification & Integration
 
-Checked on 2026-09-28 against the official Hindsight docs and the
-`vectorize-io/hindsight` repository.
+Verified against the official `@vectorize-io/hindsight-client` package and the `vectorize-io/hindsight` repository.
 
-## Confirmed
+## Confirmed TypeScript SDK Specification
 
-- Python package: `hindsight-client`
-- Import: `from hindsight_client import Hindsight`
-- Client construction: `Hindsight(base_url="...", timeout=30.0, api_key="...")`
-- Synchronous calls are documented as:
-  - `client.retain(bank_id="...", content="...")`
-  - `client.recall(bank_id="...", query="...")`
-  - `client.reflect(bank_id="...", query="...")`
-- Async variants are exposed with an `a` prefix, such as `arecall` and
-  `areflect`, so an async FastAPI adapter can use them without blocking.
-- Hindsight Cloud uses a base URL plus an optional bearer API key passed to the
-  client. The exact Cloud URL and account setup are environment-specific.
-- Recall returns a response containing source chunks. Reflect returns an
-  object with generated text and cited memories in the current docs.
-- Groq’s current Python SDK exposes `client.models.list()` and the
-  OpenAI-compatible chat completions API. Structured output uses
-  `response_format` with `json_schema` on supported models; JSON prompting and
-  validation remain the fallback.
-- LangGraph’s current Python API uses `StateGraph`, `add_node`, `add_edge`,
-  `set_entry_point`, and `compile()`.
+- **Package**: `@vectorize-io/hindsight-client` (v0.10.1)
+- **Import**: `import { HindsightClient } from "@vectorize-io/hindsight-client"`
+- **Client Construction**:
+  ```typescript
+  const client = new HindsightClient({
+    baseUrl: process.env.HINDSIGHT_BASE_URL,
+    apiKey: process.env.HINDSIGHT_API_KEY,
+    maxAttempts: 2,
+  });
+  ```
+- **Retain**:
+  ```typescript
+  await client.retain(bankId, content, {
+    context: "...",
+    documentId: `incident-${incidentId}`,
+    metadata: { incident_id, public_id, service, outcome: "verified_success" },
+    tags: [service, "incident-response", "verified-lesson"],
+  });
+  ```
+  - `documentId` guarantees idempotent replacement on repeated retentions.
+  - Returns `Promise<RetainResponse>` (`{ success: boolean, bank_id: string, items_count: number }`).
+- **Recall**:
+  ```typescript
+  await client.recall(bankId, query, { budget: "mid" });
+  ```
+  - Query is composed from incident service, symptoms, error signatures, and deployment context.
+  - Returns `Promise<RecallResponse>` containing `results: Array<RecallResult>`.
+- **Reflect**:
+  ```typescript
+  await client.reflect(bankId, query, { context, budget: "mid" });
+  ```
+  - Synthesizes reasoned answers over the bank's stored memories.
+  - Returns `Promise<ReflectResponse>` (`{ text: string }`).
+- **Health / Version Check**:
+  ```typescript
+  await client.getVersion({ signal: AbortSignal.timeout(4000) });
+  ```
+  - Returns `Promise<VersionResponse>` (`{ api_version: string }`).
 
-## Not verified in this environment
+## Environment Configuration
 
-- No Hindsight or Groq credentials are present, so a live round trip was not
-  attempted.
-- The exact Cloud bank-creation/configuration endpoint and optional document
-  metadata/upsert parameters should be checked against the installed SDK
-  version before enabling live retention.
-- The installed Python SDK was not added to this Node-based starter project.
+The server-side adapter in `artifacts/api-server/src/memoryops/hindsight.ts` reads:
+- `HINDSIGHT_BASE_URL`: Base URL of self-hosted Hindsight or Hindsight Cloud.
+- `HINDSIGHT_API_KEY`: Optional Bearer token for authenticated Hindsight deployments.
+- `HINDSIGHT_BANK_ID`: Namespace for incident memories (defaults to `memoryops-demo-northstar`).
 
-MemoryOps therefore keeps live adapters isolated behind the integration-status
-surface. The runnable demo uses synthetic fixture data and labels it as
-simulated; it does not claim that simulated recall or retention is a Hindsight
-call.
+## Failure and Fallback Behavior
+
+1. **Missing configuration**: If `HINDSIGHT_BASE_URL` is omitted, MemoryOps falls back to the internal simulated demo bank, explicitly labeling all memories as `Simulated demo memory — Hindsight unavailable`.
+2. **Network / Remote failure**: If Hindsight is configured but unreachable or fails, MemoryOps catches the error, marks the remote operation as failed (`success: false`, `is_live: false`), labels the memory as `Simulated demo memory — Hindsight recall failed: <error>`, and keeps the application operational.
+3. **Truthful reporting**: A remote failure is never reported as live success. The integration status endpoint (`/api/integrations/status`) accurately reports reachability and API version.
+
+## Verification Status
+
+- **Mocked SDK Tests**: 27 unit and integration tests passing covering constructor, configuration, retain, recall, reflect, fallback labels, idempotency, synthetic verification, and Incident A → Incident B recall flow.
+- **Live Round Trip**: Credentials (`HINDSIGHT_BASE_URL`, `HINDSIGHT_API_KEY`) are not provided in this environment. The live adapter is fully wired, verified with mocks and TypeScript compiler checks, and ready for production credentials.

@@ -17,7 +17,9 @@ import {
   summary,
   trace,
   updatePostmortem,
+  verifyRemediation,
 } from "../memoryops/store";
+import { reflectOnMemories } from "../memoryops/hindsight";
 
 const router: IRouter = Router();
 
@@ -65,11 +67,11 @@ router.get("/incidents/:incidentId", (req, res) => {
   return res.json({ ...summary(incident), evidence: incident.evidence, latest_run: investigation });
 });
 
-router.post("/incidents/:incidentId/investigate", (req, res) => {
+router.post("/incidents/:incidentId/investigate", async (req, res) => {
   const incident = requireIncident(req, res);
   if (!incident) return;
   try {
-    const run = startInvestigation(incident.id);
+    const run = await startInvestigation(incident.id);
     return res.status(202).json({ run_id: run.run_id });
   } catch (caught) {
     return error(res, 409, "investigation_failed", caught instanceof Error ? caught.message : "Investigation failed");
@@ -121,9 +123,14 @@ router.post("/incidents/:incidentId/reject-remediation", (req, res) => {
 router.post("/incidents/:incidentId/verify", (req, res) => {
   const incident = requireIncident(req, res);
   if (!incident) return;
-  const run = getInvestigation(incident.id);
-  if (!run?.execution) return error(res, 409, "no_execution", "No simulated execution exists to verify.");
-  return res.json(run);
+  try {
+    const run = verifyRemediation(incident.id);
+    return res.json(run);
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : "Verification failed";
+    const status = msg.includes("not found") ? 404 : 409;
+    return error(res, status, "verification_failed", msg);
+  }
 });
 
 router.get("/incidents/:incidentId/memory-trace", (req, res) => {
@@ -150,11 +157,12 @@ router.put("/incidents/:incidentId/postmortem", (req, res) => {
   }
 });
 
-router.post("/incidents/:incidentId/postmortem/retain", (req, res) => {
+router.post("/incidents/:incidentId/postmortem/retain", async (req, res) => {
   const incident = requireIncident(req, res);
   if (!incident) return;
   try {
-    return res.json(retainPostmortem(incident.id));
+    const pm = await retainPostmortem(incident.id);
+    return res.json(pm);
   } catch (caught) {
     return error(res, 409, "retention_failed", caught instanceof Error ? caught.message : "Retention failed");
   }
@@ -173,16 +181,20 @@ router.get("/memories/:memoryId", (req, res) => {
   return res.json({ hindsight: memory, app_metadata: { incident_id: memory.incident_id, operation_status: "success", source: memory.source } });
 });
 
-router.post("/memories/reflect", (req, res) => {
+router.post("/memories/reflect", async (req, res) => {
   const query = String((req.body as { query?: string }).query ?? "").trim();
   if (!query) return error(res, 422, "validation_error", "A reflection query is required.");
-  const memories = listMemories({ q: query });
-  return res.json({
-    text: memories.length
-      ? `Across ${memories.length} retained demo memory record(s), verified rollback or configuration correction restored service. The prior restart attempt did not hold.`
-      : "No retained memory matches this query. Resolve and review an incident to teach MemoryOps.",
-    source: "Simulated reflect — Hindsight unavailable",
-  });
+  try {
+    const result = await reflectOnMemories(query, undefined, (q) => {
+      const memories = listMemories({ q });
+      return memories.length
+        ? `Across ${memories.length} retained demo memory record(s), verified rollback or configuration correction restored service. The prior restart attempt did not hold.`
+        : "No retained memory matches this query. Resolve and review an incident to teach MemoryOps.";
+    });
+    return res.json({ text: result.text, source: result.source });
+  } catch (caught) {
+    return error(res, 500, "reflection_failed", caught instanceof Error ? caught.message : "Reflection failed");
+  }
 });
 
 router.get("/demo/scenarios", (_req, res) => res.json(listScenarios()));
@@ -192,6 +204,6 @@ router.post("/demo/reset", (req, res) => {
   resetDemo();
   return res.json({ message: "Demo incidents and simulated demo memory were removed. No live infrastructure was touched.", incidents: 0 });
 });
-router.get("/integrations/status", (_req, res) => res.json(integrationStatus()));
+router.get("/integrations/status", async (_req, res) => res.json(await integrationStatus()));
 
 export default router;
