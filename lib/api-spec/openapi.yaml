@@ -1,22 +1,25 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: MemoryOps incident response API
 servers:
   - url: /api
-    description: Base API path
 tags:
   - name: health
-    description: Health operations
+  - name: dashboard
+  - name: incidents
+  - name: investigation
+  - name: memories
+  - name: postmortems
+  - name: demo
+  - name: integrations
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,13 +27,624 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /dashboard:
+    get:
+      operationId: getDashboard
+      tags: [dashboard]
+      summary: Command center metrics
+      responses:
+        "200":
+          description: Dashboard
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Dashboard"
+  /incidents:
+    get:
+      operationId: listIncidents
+      tags: [incidents]
+      summary: List incidents
+      parameters:
+        - $ref: "#/components/parameters/StatusQuery"
+        - $ref: "#/components/parameters/SeverityQuery"
+        - $ref: "#/components/parameters/ServiceQuery"
+      responses:
+        "200":
+          description: Incidents
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Incident"
+    post:
+      operationId: createIncident
+      tags: [incidents]
+      summary: Create an incident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncidentInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Incident"
+  /incidents/{incidentId}:
+    get:
+      operationId: getIncident
+      tags: [incidents]
+      summary: Get incident detail
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Incident
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IncidentDetail"
+  /incidents/{incidentId}/investigate:
+    post:
+      operationId: startInvestigation
+      tags: [investigation]
+      summary: Start an investigation
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "202":
+          description: Investigation started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvestigationStart"
+  /incidents/{incidentId}/investigation:
+    get:
+      operationId: getInvestigation
+      tags: [investigation]
+      summary: Get investigation state
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Investigation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Investigation"
+  /incidents/{incidentId}/approve-remediation:
+    post:
+      operationId: approveRemediation
+      tags: [investigation]
+      summary: Approve a simulated remediation
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionInput"
+      responses:
+        "200":
+          description: Approval and execution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Investigation"
+  /incidents/{incidentId}/reject-remediation:
+    post:
+      operationId: rejectRemediation
+      tags: [investigation]
+      summary: Reject a remediation
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionInput"
+      responses:
+        "200":
+          description: Rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Investigation"
+  /incidents/{incidentId}/verify:
+    post:
+      operationId: verifyIncident
+      tags: [investigation]
+      summary: Verify the latest simulated execution
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Verification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Investigation"
+  /incidents/{incidentId}/memory-trace:
+    get:
+      operationId: getMemoryTrace
+      tags: [investigation]
+      summary: Explainable memory trace
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Memory trace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemoryTrace"
+  /incidents/{incidentId}/postmortem:
+    get:
+      operationId: getPostmortem
+      tags: [postmortems]
+      summary: Get an incident post-mortem
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Post-mortem
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Postmortem"
+    put:
+      operationId: updatePostmortem
+      tags: [postmortems]
+      summary: Save post-mortem edits
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostmortemInput"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Postmortem"
+  /incidents/{incidentId}/postmortem/retain:
+    post:
+      operationId: retainPostmortem
+      tags: [postmortems]
+      summary: Retain a reviewed post-mortem
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Retained
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Postmortem"
+  /memories:
+    get:
+      operationId: listMemories
+      tags: [memories]
+      summary: Search engineering memory
+      parameters:
+        - $ref: "#/components/parameters/ServiceQuery"
+        - name: q
+          in: query
+          schema: { type: string }
+        - name: outcome
+          in: query
+          schema: { type: string }
+        - name: root_cause
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Memories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Memory"
+  /memories/{memoryId}:
+    get:
+      operationId: getMemory
+      tags: [memories]
+      summary: Get memory detail
+      parameters:
+        - name: memoryId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Memory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemoryDetail"
+  /memories/reflect:
+    post:
+      operationId: reflectMemories
+      tags: [memories]
+      summary: Ask Hindsight to reflect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReflectInput"
+      responses:
+        "200":
+          description: Reflection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Reflection"
+  /demo/scenarios:
+    get:
+      operationId: listDemoScenarios
+      tags: [demo]
+      summary: List simulated scenarios
+      responses:
+        "200":
+          description: Scenarios
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Scenario"
+  /demo/load:
+    post:
+      operationId: loadDemo
+      tags: [demo]
+      summary: Load the simulated incident environment
+      responses:
+        "200":
+          description: Loaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DemoResult"
+  /demo/reset:
+    post:
+      operationId: resetDemo
+      tags: [demo]
+      summary: Reset simulated demo data
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetInput"
+      responses:
+        "200":
+          description: Reset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DemoResult"
+  /integrations/status:
+    get:
+      operationId: getIntegrationStatus
+      tags: [integrations]
+      summary: Integration health
+      responses:
+        "200":
+          description: Integration status
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Integration"
 components:
+  parameters:
+    IncidentId:
+      name: incidentId
+      in: path
+      required: true
+      schema: { type: string }
+    StatusQuery:
+      name: status
+      in: query
+      schema: { type: string }
+    SeverityQuery:
+      name: severity
+      in: query
+      schema: { type: string }
+    ServiceQuery:
+      name: service
+      in: query
+      schema: { type: string }
   schemas:
     HealthStatus:
       type: object
+      required: [status, version, db]
       properties:
-        status:
-          type: string
-      required:
-        - status
-
+        status: { type: string }
+        version: { type: string }
+        db: { type: string }
+    Incident:
+      type: object
+      required: [id, public_id, title, service, severity, status, summary, started_at, source, is_demo]
+      properties:
+        id: { type: string }
+        public_id: { type: string }
+        title: { type: string }
+        service: { type: string }
+        severity: { type: string }
+        status: { type: string }
+        summary: { type: string }
+        started_at: { type: string }
+        resolved_at: { type: ["string", "null"] }
+        source: { type: string }
+        is_demo: { type: boolean }
+        scenario_key: { type: ["string", "null"] }
+    IncidentInput:
+      type: object
+      properties:
+        scenario_key: { type: string }
+        title: { type: string }
+        service: { type: string }
+        severity: { type: string }
+        summary: { type: string }
+    IncidentDetail:
+      allOf:
+        - $ref: "#/components/schemas/Incident"
+        - type: object
+          required: [evidence]
+          properties:
+            evidence:
+              type: array
+              items: { $ref: "#/components/schemas/Evidence" }
+            latest_run:
+              oneOf:
+                - $ref: "#/components/schemas/Investigation"
+                - type: "null"
+    Evidence:
+      type: object
+      required: [id, kind, label, detail, origin, observed_at]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        label: { type: string }
+        detail: { type: string }
+        origin: { type: string }
+        observed_at: { type: string }
+    Dashboard:
+      type: object
+      required: [active_incidents, resolved_incidents, mttr_minutes, recurrence_count, memory_count, severity_breakdown, services, recent_incidents]
+      properties:
+        active_incidents: { type: integer }
+        resolved_incidents: { type: integer }
+        mttr_minutes: { type: ["number", "null"] }
+        recurrence_count: { type: integer }
+        memory_count: { type: integer }
+        severity_breakdown:
+          type: array
+          items:
+            $ref: "#/components/schemas/SeverityPoint"
+        services:
+          type: array
+          items:
+            $ref: "#/components/schemas/ServiceStatus"
+        recent_incidents:
+          type: array
+          items:
+            $ref: "#/components/schemas/Incident"
+    SeverityPoint:
+      type: object
+      required: [severity, count]
+      properties:
+        severity: { type: string }
+        count: { type: integer }
+    ServiceStatus:
+      type: object
+      required: [name, status, note]
+      properties:
+        name: { type: string }
+        status: { type: string }
+        note: { type: string }
+    InvestigationStart:
+      type: object
+      required: [run_id]
+      properties:
+        run_id: { type: string }
+    Investigation:
+      type: object
+      required: [run_id, status, stage, steps, evidence, memories, hypotheses, proposal, degraded, pre_recall_analysis, after_recall_analysis, reflection]
+      properties:
+        run_id: { type: string }
+        status: { type: string }
+        stage: { type: string }
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/WorkflowStep" }
+        evidence:
+          type: array
+          items: { $ref: "#/components/schemas/Evidence" }
+        memories:
+          type: array
+          items: { $ref: "#/components/schemas/Memory" }
+        hypotheses:
+          type: array
+          items: { $ref: "#/components/schemas/Hypothesis" }
+        proposal:
+          oneOf:
+            - $ref: "#/components/schemas/Proposal"
+            - type: "null"
+        execution:
+          oneOf:
+            - $ref: "#/components/schemas/Execution"
+            - type: "null"
+        verification:
+          oneOf:
+            - $ref: "#/components/schemas/Verification"
+            - type: "null"
+        degraded: { type: boolean }
+        pre_recall_analysis: { type: string }
+        after_recall_analysis: { type: string }
+        reflection: { type: ["string", "null"] }
+        missing_info:
+          type: array
+          items: { type: string }
+    WorkflowStep:
+      type: object
+      required: [name, label, status, detail]
+      properties:
+        name: { type: string }
+        label: { type: string }
+        status: { type: string }
+        detail: { type: string }
+    Hypothesis:
+      type: object
+      required: [rank, statement, confidence, rationale, supporting, contradicting, influence]
+      properties:
+        rank: { type: integer }
+        statement: { type: string }
+        confidence: { type: string }
+        rationale: { type: string }
+        supporting:
+          type: array
+          items: { type: string }
+        contradicting:
+          type: array
+          items: { type: string }
+        influence: { type: string }
+    Proposal:
+      type: object
+      required: [id, action_type, target, rationale, risk, expected_result, status, historical_note]
+      properties:
+        id: { type: string }
+        action_type: { type: string }
+        target: { type: string }
+        rationale: { type: string }
+        risk: { type: string }
+        expected_result: { type: string }
+        status: { type: string }
+        historical_note: { type: string }
+    Execution:
+      type: object
+      required: [status, action_type, simulated, detail]
+      properties:
+        status: { type: string }
+        action_type: { type: string }
+        simulated: { type: boolean }
+        detail: { type: string }
+    Verification:
+      type: object
+      required: [passed, method, observed_state]
+      properties:
+        passed: { type: boolean }
+        method: { type: string }
+        observed_state: { type: string }
+    Memory:
+      type: object
+      required: [id, title, service, outcome, root_cause, content, relevance, source, created_at]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        service: { type: string }
+        outcome: { type: string }
+        root_cause: { type: string }
+        content: { type: string }
+        relevance: { type: string }
+        source: { type: string }
+        created_at: { type: string }
+    MemoryDetail:
+      type: object
+      required: [hindsight, app_metadata]
+      properties:
+        hindsight: { $ref: "#/components/schemas/Memory" }
+        app_metadata:
+          type: object
+          additionalProperties: true
+    Reflection:
+      type: object
+      required: [text, source]
+      properties:
+        text: { type: string }
+        source: { type: string }
+    Postmortem:
+      type: object
+      required: [id, incident_id, summary, root_cause, timeline, lessons_learned, actions_taken, review_status, retention_status]
+      properties:
+        id: { type: string }
+        incident_id: { type: string }
+        summary: { type: string }
+        root_cause: { type: string }
+        timeline: { type: string }
+        lessons_learned: { type: string }
+        actions_taken: { type: string }
+        review_status: { type: string }
+        retention_status: { type: string }
+        retained_at: { type: ["string", "null"] }
+    PostmortemInput:
+      type: object
+      required: [summary, root_cause, timeline, lessons_learned, actions_taken]
+      properties:
+        summary: { type: string }
+        root_cause: { type: string }
+        timeline: { type: string }
+        lessons_learned: { type: string }
+        actions_taken: { type: string }
+    MemoryTrace:
+      type: object
+      required: [nodes]
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    Scenario:
+      type: object
+      required: [key, title, service, severity, description, loaded]
+      properties:
+        key: { type: string }
+        title: { type: string }
+        service: { type: string }
+        severity: { type: string }
+        description: { type: string }
+        loaded: { type: boolean }
+    DemoResult:
+      type: object
+      required: [message, incidents]
+      properties:
+        message: { type: string }
+        incidents: { type: integer }
+    ResetInput:
+      type: object
+      required: [confirm]
+      properties:
+        confirm: { type: boolean }
+    DecisionInput:
+      type: object
+      properties:
+        proposal_id: { type: string }
+        reason: { type: string }
+    ReflectInput:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string, minLength: 1 }
+    Integration:
+      type: object
+      required: [name, configured, reachable, detail]
+      properties:
+        name: { type: string }
+        configured: { type: boolean }
+        reachable: { type: boolean }
+        detail: { type: string }

@@ -1,0 +1,1 @@
+- [Demo safety boundaries](demo-safety.md) — reset requires explicit confirmation; fixture loading stays idempotent and synthetic.

@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "MemoryOps"
+description = "An AI incident-response console for SRE teams that turns verified production incidents into durable engineering memory and improves future investigations."
+version = "1.0.0"
+id = "artifacts/memoryops"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18325
+
+[services.development]
+run = "pnpm --filter @workspace/memoryops run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/memoryops", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/memoryops/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18325"
+BASE_PATH = "/"
