@@ -1,4 +1,4 @@
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
@@ -19,17 +19,26 @@ import {
 
 describe("Phase 3 & 5: Incident Lifecycle, Synthetic Verification, and End-to-End Recall Flow", () => {
   const testStateFile = resolve(".data/test-lifecycle-store.json");
+  const origEnv = { ...process.env };
 
   beforeEach(() => {
+    delete process.env.HINDSIGHT_BASE_URL;
+    delete process.env.HINDSIGHT_API_KEY;
+    delete process.env.HINDSIGHT_BANK_ID;
     process.env.MEMORYOPS_STATE_FILE = testStateFile;
     resetDemo();
     loadDemo();
   });
 
   afterEach(() => {
+    process.env = { ...origEnv };
     try {
       rmSync(testStateFile, { force: true });
     } catch {}
+  });
+
+  after(() => {
+    process.env = { ...origEnv };
   });
 
   describe("5. Verification with missing execution or failed synthetic outcome", () => {

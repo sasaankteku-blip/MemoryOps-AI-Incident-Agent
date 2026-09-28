@@ -1,8 +1,9 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import type { Server } from "node:http";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { HindsightClient } from "@vectorize-io/hindsight-client";
 import app from "../app";
 import { resetDemo, loadDemo } from "../memoryops/store";
 
@@ -10,6 +11,7 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
   let server: Server;
   let baseUrl: string;
   const testStateFile = resolve(".data/test-api-store.json");
+  const origEnv = { ...process.env };
 
   before(async () => {
     process.env.MEMORYOPS_STATE_FILE = testStateFile;
@@ -26,7 +28,19 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
     });
   });
 
+  beforeEach(() => {
+    // Isolate by default so tests are deterministic and independent of developer's terminal credentials
+    delete process.env.HINDSIGHT_BASE_URL;
+    delete process.env.HINDSIGHT_API_KEY;
+    delete process.env.HINDSIGHT_BANK_ID;
+  });
+
+  afterEach(() => {
+    process.env = { ...origEnv };
+  });
+
   after(async () => {
+    process.env = { ...origEnv };
     await new Promise<void>((res) => server.close(() => res()));
     try {
       rmSync(testStateFile, { force: true });
@@ -117,7 +131,11 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       assert.strictEqual(keys.length, uniqueKeys.size);
     });
 
-    it("GET /api/integrations/status reports truthful integration status", async () => {
+    it("GET /api/integrations/status reports truthful unconfigured status when credentials absent", async () => {
+      delete process.env.HINDSIGHT_BASE_URL;
+      delete process.env.HINDSIGHT_API_KEY;
+      delete process.env.HINDSIGHT_BANK_ID;
+
       const res = await fetch(`${baseUrl}/api/integrations/status`);
       assert.strictEqual(res.status, 200);
       const body = await res.json();
@@ -129,6 +147,51 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       assert.strictEqual(hindsight.configured, false);
       assert.strictEqual(hindsight.reachable, false);
       assert.match(hindsight.detail, /not configured/i);
+    });
+
+    it("GET /api/integrations/status reports configured but unreachable when remote service connection fails", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://127.0.0.1:54321";
+      process.env.HINDSIGHT_BANK_ID = "test-bank";
+
+      const res = await fetch(`${baseUrl}/api/integrations/status`);
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.ok(Array.isArray(body));
+      const hindsight = body.find(
+        (i: { name: string }) => i.name === "Hindsight",
+      );
+      assert.ok(hindsight);
+      // Preserves distinction: credentials are configured, but remote is unreachable
+      assert.strictEqual(hindsight.configured, true);
+      assert.strictEqual(hindsight.reachable, false);
+      assert.match(hindsight.detail, /Remote service error/i);
+    });
+
+    it("GET /api/integrations/status reports configured and reachable when remote service responds", async () => {
+      process.env.HINDSIGHT_BASE_URL = "https://api.hindsight.vectorize.io";
+      process.env.HINDSIGHT_API_KEY = "test-key";
+      process.env.HINDSIGHT_BANK_ID = "test-bank";
+
+      const origGetVersion = HindsightClient.prototype.getVersion;
+      HindsightClient.prototype.getVersion = async function () {
+        return { api_version: "0.10.1", features: {} as any };
+      };
+
+      try {
+        const res = await fetch(`${baseUrl}/api/integrations/status`);
+        assert.strictEqual(res.status, 200);
+        const body = await res.json();
+        assert.ok(Array.isArray(body));
+        const hindsight = body.find(
+          (i: { name: string }) => i.name === "Hindsight",
+        );
+        assert.ok(hindsight);
+        assert.strictEqual(hindsight.configured, true);
+        assert.strictEqual(hindsight.reachable, true);
+        assert.match(hindsight.detail, /Connected to Hindsight API v0\.10\.1/i);
+      } finally {
+        HindsightClient.prototype.getVersion = origGetVersion;
+      }
     });
 
     it("runs complete lifecycle via HTTP API: investigate -> approve -> verify -> retain", async () => {
