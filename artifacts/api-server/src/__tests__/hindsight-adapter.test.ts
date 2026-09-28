@@ -10,6 +10,7 @@ import {
   recallMemories,
   reflectOnMemories,
   validateHindsightConfig,
+  getHindsightTimeouts,
 } from "../memoryops/hindsight";
 import { HindsightClient } from "@vectorize-io/hindsight-client";
 
@@ -20,6 +21,12 @@ describe("Phase 2 & 5: Hindsight Adapter Unit & Integration Tests", () => {
     delete process.env.HINDSIGHT_BASE_URL;
     delete process.env.HINDSIGHT_API_KEY;
     delete process.env.HINDSIGHT_BANK_ID;
+    delete process.env.HINDSIGHT_TIMEOUT_MS;
+    delete process.env.HINDSIGHT_RETAIN_TIMEOUT_MS;
+    delete process.env.HINDSIGHT_RECALL_TIMEOUT_MS;
+    delete process.env.HINDSIGHT_REFLECT_TIMEOUT_MS;
+    delete process.env.HINDSIGHT_HEALTH_TIMEOUT_MS;
+    delete process.env.HINDSIGHT_MAX_RETRIES;
   });
 
   afterEach(() => {
@@ -593,6 +600,178 @@ describe("Phase 2 & 5: Hindsight Adapter Unit & Integration Tests", () => {
 
       assert.strictEqual(recallRes.isLive, true);
       assert.ok(recallRes.memories.length > 0);
+    });
+  });
+
+  describe("6. Timeouts, safe bounded retries, idempotent deduplication, and uncertain outcomes", () => {
+    it("getHindsightTimeouts returns defaults and parses custom environment variables", () => {
+      // 1. Defaults
+      const defaults = getHindsightTimeouts();
+      assert.strictEqual(defaults.healthTimeoutMs, 10000);
+      assert.strictEqual(defaults.retainTimeoutMs, 30000);
+      assert.strictEqual(defaults.recallTimeoutMs, 20000);
+      assert.strictEqual(defaults.reflectTimeoutMs, 30000);
+      assert.strictEqual(defaults.maxRetries, 2);
+
+      // 2. Custom values
+      process.env.HINDSIGHT_TIMEOUT_MS = "45000";
+      process.env.HINDSIGHT_HEALTH_TIMEOUT_MS = "5000";
+      process.env.HINDSIGHT_RETAIN_TIMEOUT_MS = "40000";
+      process.env.HINDSIGHT_RECALL_TIMEOUT_MS = "15000";
+      process.env.HINDSIGHT_REFLECT_TIMEOUT_MS = "25000";
+      process.env.HINDSIGHT_MAX_RETRIES = "4";
+
+      const custom = getHindsightTimeouts();
+      assert.strictEqual(custom.healthTimeoutMs, 5000);
+      assert.strictEqual(custom.retainTimeoutMs, 40000);
+      assert.strictEqual(custom.recallTimeoutMs, 15000);
+      assert.strictEqual(custom.reflectTimeoutMs, 25000);
+      assert.strictEqual(custom.maxRetries, 4);
+
+      // 3. Clamping safety: minimum 1000ms and maxRetries in [1, 5]
+      process.env.HINDSIGHT_HEALTH_TIMEOUT_MS = "-100";
+      process.env.HINDSIGHT_MAX_RETRIES = "10";
+      const clamped = getHindsightTimeouts();
+      assert.strictEqual(clamped.healthTimeoutMs, 1000);
+      assert.strictEqual(clamped.maxRetries, 5);
+    });
+
+    it("retainVerifiedLesson retries on transient timeout and recovers on attempt 2", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_BANK_ID = "retry-bank";
+      process.env.HINDSIGHT_MAX_RETRIES = "2";
+
+      let attempts = 0;
+      let recordedOptions: any = null;
+      const originalRetain = HindsightClient.prototype.retain;
+      HindsightClient.prototype.retain = async function (
+        bankId: string,
+        content: unknown,
+        options?: any,
+      ) {
+        attempts++;
+        recordedOptions = options;
+        if (attempts === 1) {
+          throw new Error("retainBatch failed: The operation was aborted due to timeout");
+        }
+        return {
+          success: true,
+          bank_id: bankId,
+          items_count: 1,
+          async: false,
+        };
+      };
+
+      try {
+        const result = await retainVerifiedLesson(
+          {
+            incidentId: "inc-retry-1",
+            publicId: "INC-2025-0117",
+            title: "Payment pool recovery",
+            service: "payment-api",
+            rootCause: "DB_POOL_MAX reduction",
+            symptoms: "HTTP 503 error burst",
+            actionsTaken: "rollback",
+            lessonsLearned: "Restart only temporarily cleared pool",
+          },
+          () => ({ id: "fallback" }),
+        );
+
+        assert.strictEqual(result.success, true);
+        assert.strictEqual(result.isLive, true);
+        assert.strictEqual(attempts, 2, "Should have retried exactly once after first transient timeout");
+        // Verify idempotent deduplication fields
+        assert.strictEqual(recordedOptions?.documentId, "incident-inc-retry-1");
+        assert.strictEqual(recordedOptions?.updateMode, "replace");
+      } finally {
+        HindsightClient.prototype.retain = originalRetain;
+      }
+    });
+
+    it("retainVerifiedLesson recovers if server indexed document despite client timeout (uncertain outcome)", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_BANK_ID = "uncertain-bank";
+      process.env.HINDSIGHT_MAX_RETRIES = "1";
+
+      const originalRetain = HindsightClient.prototype.retain;
+      const originalRecall = HindsightClient.prototype.recall;
+
+      // Simulate retain call timing out from client perspective
+      HindsightClient.prototype.retain = async function () {
+        throw new Error("The operation was aborted due to timeout");
+      };
+
+      // But verify recall reveals the document reached the server!
+      HindsightClient.prototype.recall = async function () {
+        return {
+          results: [
+            {
+              id: "mem-indexed-1",
+              text: "Verified Root Cause: DB_POOL_MAX reduction incident INC-2025-0117",
+              document_id: "incident-inc-uncertain-1",
+            },
+          ],
+        };
+      };
+
+      try {
+        const result = await retainVerifiedLesson(
+          {
+            incidentId: "inc-uncertain-1",
+            publicId: "INC-2025-0117",
+            title: "Payment pool recovery",
+            service: "payment-api",
+            rootCause: "DB_POOL_MAX reduction",
+            symptoms: "HTTP 503",
+            actionsTaken: "rollback",
+            lessonsLearned: "Restart only temporarily cleared pool",
+          },
+          () => ({ id: "fallback" }),
+        );
+
+        assert.strictEqual(result.success, true);
+        assert.strictEqual(result.isLive, true);
+        assert.strictEqual(result.source, "Live Hindsight bank (uncertain-bank)");
+      } finally {
+        HindsightClient.prototype.retain = originalRetain;
+        HindsightClient.prototype.recall = originalRecall;
+      }
+    });
+
+    it("preserves exact error detail without exposing secrets when retention persistently fails", async () => {
+      process.env.HINDSIGHT_BASE_URL = "http://mock-hindsight:8888";
+      process.env.HINDSIGHT_API_KEY = "SUPER_SECRET_KEY_12345";
+      process.env.HINDSIGHT_MAX_RETRIES = "1";
+
+      const originalRetain = HindsightClient.prototype.retain;
+      HindsightClient.prototype.retain = async function () {
+        throw new Error("retainBatch failed: The operation was aborted due to timeout");
+      };
+
+      try {
+        const result = await retainVerifiedLesson(
+          {
+            incidentId: "inc-fail",
+            publicId: "INC-2025-9999",
+            title: "Timeout incident",
+            service: "payment-api",
+            rootCause: "Root cause",
+            symptoms: "Symptoms",
+            actionsTaken: "Actions",
+            lessonsLearned: "Lessons",
+          },
+          () => ({ id: "fallback" }),
+        );
+
+        assert.strictEqual(result.success, false);
+        assert.strictEqual(result.isLive, false);
+        assert.match(result.error || "", /aborted due to timeout/);
+        // Ensure secret API key is NEVER exposed in the error message or source
+        assert.doesNotMatch(result.error || "", /SUPER_SECRET_KEY/);
+        assert.doesNotMatch(result.source, /SUPER_SECRET_KEY/);
+      } finally {
+        HindsightClient.prototype.retain = originalRetain;
+      }
     });
   });
 });

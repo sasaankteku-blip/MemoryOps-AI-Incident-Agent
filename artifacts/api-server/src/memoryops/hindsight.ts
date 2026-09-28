@@ -149,6 +149,40 @@ export function createHindsightClient(): {
   return { client, bankId: config.bankId };
 }
 
+export interface HindsightTimeouts {
+  healthTimeoutMs: number;
+  retainTimeoutMs: number;
+  recallTimeoutMs: number;
+  reflectTimeoutMs: number;
+  maxRetries: number;
+}
+
+export function getHindsightTimeouts(): HindsightTimeouts {
+  const baseTimeout = Number(process.env.HINDSIGHT_TIMEOUT_MS) || 30000;
+  return {
+    healthTimeoutMs: Math.max(
+      1000,
+      Number(process.env.HINDSIGHT_HEALTH_TIMEOUT_MS) || 10000,
+    ),
+    retainTimeoutMs: Math.max(
+      1000,
+      Number(process.env.HINDSIGHT_RETAIN_TIMEOUT_MS) || baseTimeout,
+    ),
+    recallTimeoutMs: Math.max(
+      1000,
+      Number(process.env.HINDSIGHT_RECALL_TIMEOUT_MS) || 20000,
+    ),
+    reflectTimeoutMs: Math.max(
+      1000,
+      Number(process.env.HINDSIGHT_REFLECT_TIMEOUT_MS) || 30000,
+    ),
+    maxRetries: Math.max(
+      1,
+      Math.min(5, Number(process.env.HINDSIGHT_MAX_RETRIES) || 2),
+    ),
+  };
+}
+
 export async function checkHindsightHealth(): Promise<{
   configured: boolean;
   reachable: boolean;
@@ -173,6 +207,7 @@ export async function checkHindsightHealth(): Promise<{
   }
 
   const config = getHindsightConfig()!;
+  const timeouts = getHindsightTimeouts();
   try {
     const hindsight = createHindsightClient();
     if (!hindsight) {
@@ -184,7 +219,7 @@ export async function checkHindsightHealth(): Promise<{
       };
     }
     const version = await hindsight.client.getVersion({
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(timeouts.healthTimeoutMs),
     });
     return {
       configured: true,
@@ -224,6 +259,8 @@ export function formatRetainedContent(input: RetainLessonInput): string {
 
 /**
  * Retain verified lesson in Hindsight (or record failure / fallback).
+ * Uses configurable timeouts, idempotent replacement (updateMode: "replace"),
+ * and bounded retries with jittered backoff for transient timeouts/5xx errors.
  */
 export async function retainVerifiedLesson(
   input: RetainLessonInput,
@@ -246,48 +283,110 @@ export async function retainVerifiedLesson(
   }
 
   const { client, bankId } = hindsight;
+  const timeouts = getHindsightTimeouts();
+  const documentId = `incident-${input.incidentId}`;
 
-  try {
-    // Retain with documentId for idempotent replacement on retry
-    const res = await client.retain(bankId, content, {
-      context: `Verified post-mortem for incident ${input.publicId} (${input.service})`,
-      documentId: `incident-${input.incidentId}`,
-      metadata: {
-        incident_id: input.incidentId,
-        public_id: input.publicId,
-        service: input.service,
-        verified: "true",
-        outcome: "verified_success",
-      },
-      tags: [input.service, "incident-response", "verified-lesson"],
-      signal: AbortSignal.timeout(8000),
-    });
+  let lastError: Error | null = null;
+  const maxAttempts = timeouts.maxRetries;
 
-    if (res && res.success !== false) {
-      return {
-        success: true,
-        isLive: true,
-        bankId,
-        memoryId: `hindsight-${input.publicId}`,
-        content,
-        source: `Live Hindsight bank (${bankId})`,
-      };
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Retain with documentId and updateMode: "replace" for idempotent replacement on retry
+      const res = await client.retain(bankId, content, {
+        context: `Verified post-mortem for incident ${input.publicId} (${input.service})`,
+        documentId,
+        updateMode: "replace",
+        metadata: {
+          incident_id: input.incidentId,
+          public_id: input.publicId,
+          service: input.service,
+          verified: "true",
+          outcome: "verified_success",
+        },
+        tags: [input.service, "incident-response", "verified-lesson"],
+        signal: AbortSignal.timeout(timeouts.retainTimeoutMs),
+      });
+
+      if (res && res.success !== false) {
+        return {
+          success: true,
+          isLive: true,
+          bankId,
+          memoryId: `hindsight-${input.publicId}`,
+          content,
+          source: `Live Hindsight bank (${bankId})`,
+        };
+      }
+
+      throw new Error("Hindsight retain returned unsuccessful response");
+    } catch (caught) {
+      lastError = caught instanceof Error ? caught : new Error(String(caught));
+      const errMsg = lastError.message.toLowerCase();
+      const isTransient =
+        errMsg.includes("timeout") ||
+        errMsg.includes("aborted") ||
+        errMsg.includes("econnreset") ||
+        errMsg.includes("etimedout") ||
+        errMsg.includes("503") ||
+        errMsg.includes("504") ||
+        errMsg.includes("429");
+
+      // Before retrying or failing on a timeout, verify if the document was actually indexed on the server
+      if (isTransient) {
+        try {
+          const verifyRecall = await client.recall(
+            bankId,
+            `${input.service} ${input.publicId}`,
+            {
+              budget: "low",
+              signal: AbortSignal.timeout(
+                Math.min(timeouts.recallTimeoutMs, 10000),
+              ),
+            },
+          );
+          const alreadyIndexed = verifyRecall.results?.some(
+            (r) =>
+              r.document_id === documentId ||
+              r.text.includes(input.publicId),
+          );
+          if (alreadyIndexed) {
+            return {
+              success: true,
+              isLive: true,
+              bankId,
+              memoryId: `hindsight-${input.publicId}`,
+              content,
+              source: `Live Hindsight bank (${bankId})`,
+            };
+          }
+        } catch {
+          // If check fails, continue with bounded retry
+        }
+
+        if (attempt < maxAttempts) {
+          // Safe bounded backoff with jitter
+          const backoffMs = 1500 * attempt + Math.floor(Math.random() * 500);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          continue;
+        }
+      }
+      break;
     }
-
-    throw new Error("Hindsight retain returned unsuccessful response");
-  } catch (caught) {
-    const errorMsg = caught instanceof Error ? caught.message : String(caught);
-    // CRITICAL: A remote operation failure must never be displayed as live success!
-    return {
-      success: false,
-      isLive: false,
-      bankId,
-      memoryId: "",
-      content,
-      source: `Failed Hindsight retain — ${errorMsg}`,
-      error: errorMsg,
-    };
   }
+
+  const finalErrMsg = lastError
+    ? lastError.message
+    : "Unknown error during Hindsight retain";
+  // CRITICAL: A remote operation failure must never be displayed as live success!
+  return {
+    success: false,
+    isLive: false,
+    bankId,
+    memoryId: "",
+    content,
+    source: `Failed Hindsight retain — ${finalErrMsg}`,
+    error: finalErrMsg,
+  };
 }
 
 /**
@@ -328,10 +427,11 @@ export async function recallMemories(
     };
   }
 
+  const timeouts = getHindsightTimeouts();
   try {
     const res = await hindsight.client.recall(bankId, query, {
       budget: "mid",
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeouts.recallTimeoutMs),
     });
 
     if (res && Array.isArray(res.results)) {
@@ -407,11 +507,12 @@ export async function reflectOnMemories(
     };
   }
 
+  const timeouts = getHindsightTimeouts();
   try {
     const res = await hindsight.client.reflect(bankId, query, {
       context,
       budget: "mid",
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(timeouts.reflectTimeoutMs),
     });
 
     if (res && typeof res.text === "string") {
