@@ -36,11 +36,21 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
   });
 
   afterEach(() => {
-    process.env = { ...origEnv };
+    for (const key of Object.keys(process.env)) {
+      if (!(key in origEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, origEnv);
   });
 
   after(async () => {
-    process.env = { ...origEnv };
+    for (const key of Object.keys(process.env)) {
+      if (!(key in origEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, origEnv);
     await new Promise<void>((res) => server.close(() => res()));
     try {
       rmSync(testStateFile, { force: true });
@@ -131,7 +141,7 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       assert.strictEqual(keys.length, uniqueKeys.size);
     });
 
-    it("GET /api/integrations/status reports truthful unconfigured status when credentials absent", async () => {
+    it("GET /api/integrations/status reports truthful integration status", async () => {
       delete process.env.HINDSIGHT_BASE_URL;
       delete process.env.HINDSIGHT_API_KEY;
       delete process.env.HINDSIGHT_BANK_ID;
