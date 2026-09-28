@@ -67,7 +67,9 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       const body = await res.json();
       assert.ok(Array.isArray(body));
       assert.ok(body.length >= 5);
-      const incA = body.find((i: { scenario_key?: string }) => i.scenario_key === "payment-outage-a");
+      const incA = body.find(
+        (i: { scenario_key?: string }) => i.scenario_key === "payment-outage-a",
+      );
       assert.ok(incA);
       assert.strictEqual(incA.service, "payment-api");
     });
@@ -94,7 +96,9 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       assert.strictEqual(res.status, 200);
       const body = await res.json();
       assert.ok(Array.isArray(body));
-      assert.ok(body.some((s: { key: string }) => s.key === "payment-outage-a"));
+      assert.ok(
+        body.some((s: { key: string }) => s.key === "payment-outage-a"),
+      );
     });
 
     it("POST /api/demo/load is idempotent and does not create duplicate fixtures", async () => {
@@ -118,7 +122,9 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       assert.strictEqual(res.status, 200);
       const body = await res.json();
       assert.ok(Array.isArray(body));
-      const hindsight = body.find((i: { name: string }) => i.name === "Hindsight");
+      const hindsight = body.find(
+        (i: { name: string }) => i.name === "Hindsight",
+      );
       assert.ok(hindsight);
       assert.strictEqual(hindsight.configured, false);
       assert.strictEqual(hindsight.reachable, false);
@@ -129,43 +135,83 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       // Find payment outage A
       const listRes = await fetch(`${baseUrl}/api/incidents`);
       const incidents = await listRes.json();
-      const incA = incidents.find((i: { scenario_key?: string }) => i.scenario_key === "payment-outage-a");
+      const incA = incidents.find(
+        (i: { scenario_key?: string }) => i.scenario_key === "payment-outage-a",
+      );
       assert.ok(incA);
 
       // 1. Start investigation
-      const invRes = await fetch(`${baseUrl}/api/incidents/${incA.id}/investigate`, { method: "POST" });
+      const invRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/investigate`,
+        { method: "POST" },
+      );
       assert.strictEqual(invRes.status, 202);
 
       // 2. Fetch investigation
-      const getInvRes = await fetch(`${baseUrl}/api/incidents/${incA.id}/investigation`);
+      const getInvRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/investigation`,
+      );
       const inv = await getInvRes.json();
       assert.strictEqual(inv.status, "awaiting_approval");
       assert.strictEqual(inv.proposal.action_type, "rollback");
 
       // 3. Verify before execution returns 409
-      const earlyVerify = await fetch(`${baseUrl}/api/incidents/${incA.id}/verify`, { method: "POST" });
+      const earlyVerify = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/verify`,
+        { method: "POST" },
+      );
       assert.strictEqual(earlyVerify.status, 409);
 
       // 4. Approve
-      const approveRes = await fetch(`${baseUrl}/api/incidents/${incA.id}/approve-remediation`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: "Approved simulated rollback" }),
-      });
+      const approveRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/approve-remediation`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: "Approved simulated rollback" }),
+        },
+      );
       assert.strictEqual(approveRes.status, 200);
       const approvedInv = await approveRes.json();
       assert.ok(approvedInv.execution);
       assert.strictEqual(approvedInv.verification, null);
 
       // 5. Verify
-      const verifyRes = await fetch(`${baseUrl}/api/incidents/${incA.id}/verify`, { method: "POST" });
+      const verifyRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/verify`,
+        { method: "POST" },
+      );
       assert.strictEqual(verifyRes.status, 200);
       const verifiedInv = await verifyRes.json();
       assert.strictEqual(verifiedInv.verification.passed, true);
       assert.strictEqual(verifiedInv.status, "completed");
 
-      // 6. Retain postmortem
-      const retainRes = await fetch(`${baseUrl}/api/incidents/${incA.id}/postmortem/retain`, { method: "POST" });
+      // 6. Retain postmortem before review is REJECTED with 409
+      const unreviewedRetainRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/postmortem/retain`,
+        { method: "POST" },
+      );
+      assert.strictEqual(unreviewedRetainRes.status, 409);
+      const unreviewedErr = await unreviewedRetainRes.json();
+      assert.match(
+        unreviewedErr.error.message,
+        /Post-mortem must be reviewed before retention/,
+      );
+
+      // 7. Review postmortem via review endpoint
+      const reviewRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/postmortem/review`,
+        { method: "POST" },
+      );
+      assert.strictEqual(reviewRes.status, 200);
+      const reviewedPm = await reviewRes.json();
+      assert.strictEqual(reviewedPm.review_status, "reviewed");
+
+      // 8. Retain reviewed postmortem succeeds
+      const retainRes = await fetch(
+        `${baseUrl}/api/incidents/${incA.id}/postmortem/retain`,
+        { method: "POST" },
+      );
       assert.strictEqual(retainRes.status, 200);
       const retainedPm = await retainRes.json();
       assert.strictEqual(retainedPm.retention_status, "retained");
@@ -181,7 +227,9 @@ describe("Phase 4 & 5: HTTP Endpoints, Router Mount, Health, and Core API", () =
       const reflectRes = await fetch(`${baseUrl}/api/memories/reflect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: "What was learned about payment-api connection pool?" }),
+        body: JSON.stringify({
+          query: "What was learned about payment-api connection pool?",
+        }),
       });
       assert.strictEqual(reflectRes.status, 200);
       const reflectBody = await reflectRes.json();

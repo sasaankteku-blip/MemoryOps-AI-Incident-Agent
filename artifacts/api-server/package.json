@@ -8,7 +8,8 @@
     "build": "node ./build.mjs",
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test \"src/__tests__/**/*.test.ts\""
+    "test": "tsx --test \"src/__tests__/**/*.test.ts\"",
+    "verify-hindsight": "tsx ./src/scripts/verify-live-hindsight.ts"
   },
   "dependencies": {
     "@vectorize-io/hindsight-client": "^0.10.1",

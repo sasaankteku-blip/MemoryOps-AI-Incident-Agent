@@ -68,13 +68,66 @@ export interface ReflectOutput {
   error?: string;
 }
 
+export interface HindsightConfigValidation {
+  configured: boolean;
+  valid: boolean;
+  baseUrl?: string;
+  bankId?: string;
+  hasApiKey: boolean;
+  error?: string;
+}
+
+export function validateHindsightConfig(): HindsightConfigValidation {
+  const rawUrl = process.env.HINDSIGHT_BASE_URL?.trim();
+  const rawBankId =
+    process.env.HINDSIGHT_BANK_ID?.trim() || "memoryops-demo-northstar";
+  const hasApiKey = Boolean(process.env.HINDSIGHT_API_KEY?.trim());
+
+  if (!rawUrl) {
+    return {
+      configured: false,
+      valid: false,
+      hasApiKey,
+      error:
+        "HINDSIGHT_BASE_URL is not configured — simulated fallback active.",
+    };
+  }
+
+  try {
+    const parsed = new URL(rawUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return {
+        configured: true,
+        valid: false,
+        hasApiKey,
+        error: "HINDSIGHT_BASE_URL must use http:// or https:// protocol.",
+      };
+    }
+    return {
+      configured: true,
+      valid: true,
+      baseUrl: rawUrl,
+      bankId: rawBankId,
+      hasApiKey,
+    };
+  } catch {
+    return {
+      configured: true,
+      valid: false,
+      hasApiKey,
+      error:
+        "HINDSIGHT_BASE_URL is malformed. Expected valid http:// or https:// URL.",
+    };
+  }
+}
+
 export function getHindsightConfig(): HindsightConfig | null {
-  const baseUrl = process.env.HINDSIGHT_BASE_URL?.trim();
-  if (!baseUrl) return null;
+  const val = validateHindsightConfig();
+  if (!val.valid || !val.baseUrl) return null;
   return {
-    baseUrl,
+    baseUrl: val.baseUrl,
     apiKey: process.env.HINDSIGHT_API_KEY?.trim() || undefined,
-    bankId: process.env.HINDSIGHT_BANK_ID?.trim() || "memoryops-demo-northstar",
+    bankId: val.bankId || "memoryops-demo-northstar",
   };
 }
 
@@ -82,7 +135,10 @@ export function isHindsightConfigured(): boolean {
   return getHindsightConfig() !== null;
 }
 
-export function createHindsightClient(): { client: HindsightClient; bankId: string } | null {
+export function createHindsightClient(): {
+  client: HindsightClient;
+  bankId: string;
+} | null {
   const config = getHindsightConfig();
   if (!config) return null;
   const client = new HindsightClient({
@@ -93,23 +149,38 @@ export function createHindsightClient(): { client: HindsightClient; bankId: stri
   return { client, bankId: config.bankId };
 }
 
-export async function checkHindsightHealth(): Promise<{ configured: boolean; reachable: boolean; detail: string }> {
-  const config = getHindsightConfig();
-  if (!config) {
+export async function checkHindsightHealth(): Promise<{
+  configured: boolean;
+  reachable: boolean;
+  detail: string;
+}> {
+  const val = validateHindsightConfig();
+  if (!val.configured) {
     return {
       configured: false,
       reachable: false,
-      detail: "HINDSIGHT_BASE_URL not configured — demo memory is explicitly simulated.",
+      detail:
+        "HINDSIGHT_BASE_URL is not configured — simulated fallback active.",
     };
   }
 
+  if (!val.valid) {
+    return {
+      configured: true,
+      reachable: false,
+      detail: `Configuration error: ${val.error}`,
+    };
+  }
+
+  const config = getHindsightConfig()!;
   try {
     const hindsight = createHindsightClient();
     if (!hindsight) {
       return {
-        configured: false,
+        configured: true,
         reachable: false,
-        detail: "HINDSIGHT_BASE_URL is invalid or missing.",
+        detail:
+          "Failed to initialize Hindsight client from valid configuration.",
       };
     }
     const version = await hindsight.client.getVersion({
@@ -121,10 +192,11 @@ export async function checkHindsightHealth(): Promise<{ configured: boolean; rea
       detail: `Connected to Hindsight API v${version.api_version || "unknown"} (bank: ${config.bankId})`,
     };
   } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
     return {
       configured: true,
       reachable: false,
-      detail: `Hindsight configured at ${config.baseUrl} but unreachable: ${err instanceof Error ? err.message : String(err)}`,
+      detail: `Remote service error connecting to ${config.baseUrl}: ${errMessage}`,
     };
   }
 }
@@ -134,7 +206,9 @@ export async function checkHindsightHealth(): Promise<{ configured: boolean; rea
  * Only retained after successful synthetic verification.
  */
 export function formatRetainedContent(input: RetainLessonInput): string {
-  const conditions = input.conditions || `Applies to ${input.service} when encountering similar error signatures or deployment changes.`;
+  const conditions =
+    input.conditions ||
+    `Applies to ${input.service} when encountering similar error signatures or deployment changes.`;
   return [
     `Incident ${input.publicId} on service ${input.service}.`,
     `Symptoms: ${input.symptoms}`,
@@ -143,7 +217,9 @@ export function formatRetainedContent(input: RetainLessonInput): string {
     `Successful Remediation: ${input.actionsTaken}`,
     `Lessons Learned: ${input.lessonsLearned}`,
     `Applicable Conditions: ${conditions}`,
-  ].filter(Boolean).join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 /**
@@ -151,7 +227,7 @@ export function formatRetainedContent(input: RetainLessonInput): string {
  */
 export async function retainVerifiedLesson(
   input: RetainLessonInput,
-  simulatedFallbackFn: (content: string) => { id: string }
+  simulatedFallbackFn: (content: string) => { id: string },
 ): Promise<RetainResult> {
   const hindsight = createHindsightClient();
   const content = formatRetainedContent(input);
@@ -219,7 +295,10 @@ export async function retainVerifiedLesson(
  */
 export async function recallMemories(
   input: RecallInput,
-  fallbackLocalMemoriesFn: (query: string, service: string) => RecalledMemoryItem[]
+  fallbackLocalMemoriesFn: (
+    query: string,
+    service: string,
+  ) => RecalledMemoryItem[],
 ): Promise<RecallOutput> {
   const queryParts = [input.service, input.symptoms];
   if (input.errorSignature) queryParts.push(input.errorSignature);
@@ -227,15 +306,20 @@ export async function recallMemories(
   const query = input.query || queryParts.join(" ");
 
   const hindsight = createHindsightClient();
-  const bankId = hindsight?.bankId || process.env.HINDSIGHT_BANK_ID || "memoryops-demo-northstar";
+  const bankId =
+    hindsight?.bankId ||
+    process.env.HINDSIGHT_BANK_ID ||
+    "memoryops-demo-northstar";
 
   if (!hindsight) {
     // Hindsight is not configured: use simulated fallback
-    const localMemories = fallbackLocalMemoriesFn(query, input.service).map((m) => ({
-      ...m,
-      is_live: false,
-      source: "Simulated demo memory — Hindsight unavailable",
-    }));
+    const localMemories = fallbackLocalMemoriesFn(query, input.service).map(
+      (m) => ({
+        ...m,
+        is_live: false,
+        source: "Simulated demo memory — Hindsight unavailable",
+      }),
+    );
     return {
       memories: localMemories,
       isLive: false,
@@ -251,19 +335,22 @@ export async function recallMemories(
     });
 
     if (res && Array.isArray(res.results)) {
-      const liveMemories: RecalledMemoryItem[] = res.results.map((r: RecallResult, idx: number) => ({
-        id: r.id || `live-mem-${idx}`,
-        title: r.context || `Live Hindsight memory (${input.service})`,
-        service: (r.entities && r.entities[0]) || input.service,
-        outcome: "verified_success",
-        root_cause: r.text,
-        content: r.text,
-        relevance: "retrieved_from_live_bank",
-        source: `Live Hindsight bank (${bankId})`,
-        created_at: r.mentioned_at || r.occurred_start || new Date().toISOString(),
-        incident_id: r.document_id || "",
-        is_live: true,
-      }));
+      const liveMemories: RecalledMemoryItem[] = res.results.map(
+        (r: RecallResult, idx: number) => ({
+          id: r.id || `live-mem-${idx}`,
+          title: r.context || `Live Hindsight memory (${input.service})`,
+          service: (r.entities && r.entities[0]) || input.service,
+          outcome: "verified_success",
+          root_cause: r.text,
+          content: r.text,
+          relevance: "retrieved_from_live_bank",
+          source: `Live Hindsight bank (${bankId})`,
+          created_at:
+            r.mentioned_at || r.occurred_start || new Date().toISOString(),
+          incident_id: r.document_id || "",
+          is_live: true,
+        }),
+      );
 
       return {
         memories: liveMemories,
@@ -277,11 +364,13 @@ export async function recallMemories(
   } catch (caught) {
     const errorMsg = caught instanceof Error ? caught.message : String(caught);
     // Fall back to local store with clear error annotation
-    const localMemories = fallbackLocalMemoriesFn(query, input.service).map((m) => ({
-      ...m,
-      is_live: false,
-      source: `Simulated demo memory — Hindsight recall failed: ${errorMsg}`,
-    }));
+    const localMemories = fallbackLocalMemoriesFn(query, input.service).map(
+      (m) => ({
+        ...m,
+        is_live: false,
+        source: `Simulated demo memory — Hindsight recall failed: ${errorMsg}`,
+      }),
+    );
     return {
       memories: localMemories,
       isLive: false,
@@ -298,10 +387,13 @@ export async function recallMemories(
 export async function reflectOnMemories(
   query: string,
   context?: string,
-  fallbackSimulatedFn?: (q: string) => string
+  fallbackSimulatedFn?: (q: string) => string,
 ): Promise<ReflectOutput> {
   const hindsight = createHindsightClient();
-  const bankId = hindsight?.bankId || process.env.HINDSIGHT_BANK_ID || "memoryops-demo-northstar";
+  const bankId =
+    hindsight?.bankId ||
+    process.env.HINDSIGHT_BANK_ID ||
+    "memoryops-demo-northstar";
 
   if (!hindsight) {
     const fallbackText = fallbackSimulatedFn
